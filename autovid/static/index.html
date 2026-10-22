@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AutoVid review</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2129; --line:#2c313c; --fg:#e8eaf0; --dim:#8b93a5; --acc:#6ea8fe; --ok:#5dd39e; --warn:#f2b561; --bad:#ef7a7a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,Segoe UI,sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 18px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); }
+  header h1 { font-size:16px; margin:0; }
+  nav button { background:none; border:1px solid var(--line); color:var(--dim); padding:5px 12px; border-radius:6px; cursor:pointer; }
+  nav button.active { color:var(--fg); border-color:var(--acc); }
+  main { padding:18px; max-width:1100px; margin:0 auto; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.ok { color:var(--ok); } .pill.warn { color:var(--warn); } .pill.bad { color:var(--bad); }
+  input,select { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  button.act { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  button.act:hover { border-color:var(--acc); }
+  .row-actions { display:flex; gap:6px; }
+  video { width:280px; border-radius:6px; background:#000; }
+  #edlList li { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:8px; display:flex; gap:10px; align-items:center; }
+  #edlList .grow { flex:1; }
+  .dim { color:var(--dim); }
+  .hidden { display:none; }
+  .toolbar { display:flex; gap:10px; margin-bottom:14px; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AutoVid</h1>
+  <nav>
+    <button data-view="catalog" class="active">Catalog</button>
+    <button data-view="review">Review queue</button>
+    <button data-view="edl">Storyboard / EDL</button>
+  </nav>
+  <span class="dim" id="statusLine"></span>
+</header>
+<main>
+  <section id="view-catalog">
+    <div class="toolbar">
+      <input id="q" placeholder="search descriptions &amp; tags…" size="34">
+      <button class="act" onclick="loadSegments()">Search</button>
+    </div>
+    <table id="assetTable">
+      <thead><tr><th>asset</th><th>name</th><th>status</th><th>dur</th><th>segments</th><th>decisions</th><th>dups</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>Segments</h3>
+    <table id="segTable">
+      <thead><tr><th>span</th><th>verdict</th><th>score</th><th>description</th><th>tags</th><th>clip</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="view-review" class="hidden">
+    <p class="dim">Segments the decision layer could not accept outright. Approve to make them storyboard-eligible; reject to hide.</p>
+    <table id="reviewTable">
+      <thead><tr><th>span</th><th>verdict</th><th>confidence</th><th>description</th><th>preview</th><th>decision</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="view-edl" class="hidden">
+    <div class="toolbar">
+      <select id="edlSelect" onchange="loadEdl()"></select>
+      <button class="act" onclick="moveEdl(-1)">↑ move up</button>
+      <button class="act" onclick="moveEdl(1)">↓ move down</button>
+      <button class="act" onclick="removeItem()">✕ remove</button>
+      <button class="act" onclick="saveEdl()">Save</button>
+      <button class="act" onclick="renderEdl()">▶ Render preview</button>
+      <span id="edlInfo" class="dim"></span>
+    </div>
+    <ul id="edlList" style="list-style:none;padding:0"></ul>
+    <video id="preview" controls></video>
+    <p class="dim" id="renderInfo"></p>
+  </section>
+</main>
+<script>
+let SEGS = [], EDL = null, SEL = -1;
+
+const $ = (s) => document.querySelector(s);
+async function api(path, opts) {
+  const r = await fetch(path, opts && {headers:{"Content-Type":"application/json"}, ...opts,
+    body: opts && opts.body ? JSON.stringify(opts.body) : undefined});
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.status);
+  return r.json();
+}
+
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
+  ["catalog","review","edl"].forEach(v => $("#view-"+v).classList.toggle("hidden", v !== b.dataset.view));
+  if (b.dataset.view === "catalog") { loadAssets(); loadSegments(); }
+  if (b.dataset.view === "review") loadReview();
+  if (b.dataset.view === "edl") loadEdlList();
+});
+
+function pill(text, cls) { return `<span class="pill ${cls||''}">${text}</span>`; }
+
+async function loadAssets() {
+  const rows = await api("/api/assets");
+  $("#assetTable tbody").innerHTML = rows.map(a => `<tr>
+    <td class="dim">${a.id}</td><td>${a.name}</td>
+    <td>${pill(a.status, a.status === "error" ? "bad" : a.status === "organized" ? "ok" : "warn")}</td>
+    <td>${a.duration_s.toFixed(1)}s</td><td>${a.segments}</td><td>${a.decisions}</td>
+    <td>${a.duplicates.length || ""}</td></tr>`).join("");
+  $("#statusLine").textContent = `${rows.length} assets`;
+}
+
+async function loadSegments() {
+  const q = $("#q").value.trim();
+  SEGS = await api("/api/segments" + (q ? `?q=${encodeURIComponent(q)}` : ""));
+  $("#segTable tbody").innerHTML = SEGS.map(s => `<tr>
+    <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
+    <td>${pill(s.verdict || "—", s.verdict === "accept" ? "ok" : s.verdict === "reject" ? "bad" : "warn")}</td>
+    <td>${s.highlight_score == null ? "" : s.highlight_score.toFixed(2)}</td>
+    <td>${s.description || ""}</td>
+    <td class="dim">${JSON.parse(s.tags_json || "[]").join(", ")}</td>
+    <td>${s.clip_path ? `<a href="/clips/${s.id}" target="_blank">clip</a>` : ""}</td></tr>`).join("");
+}
+
+async function loadReview() {
+  const all = await api("/api/segments");
+  const pending = all.filter(s => s.review_status === "pending");
+  $("#reviewTable tbody").innerHTML = pending.map(s => `<tr>
+    <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
+    <td>${pill(s.verdict, "warn")}</td>
+    <td>${s.decision_confidence == null ? "" : s.decision_confidence.toFixed(2)}</td>
+    <td>${s.description || ""}</td>
+    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted></video>` : '<span class="dim">no clip</span>'}</td>
+    <td><div class="row-actions">
+      <button class="act" onclick="review(${s.id},'approved')">approve</button>
+      <button class="act" onclick="review(${s.id},'rejected')">reject</button>
+    </div></td></tr>`).join("") || '<tr><td colspan="6" class="dim">queue empty</td></tr>';
+}
+
+async function review(id, status) { await api(`/api/segments/${id}/review?status=${status}`, {method:"POST"}); loadReview(); }
+
+async function loadEdlList() {
+  const rows = await api("/api/edls");
+  $("#edlSelect").innerHTML = rows.map(e => `<option value="${e.id}">${e.name} (${e.id})</option>`).join("")
+    || '<option value="">no EDLs yet — run `autovid storyboard`</option>';
+  if (rows.length) { $("#edlSelect").value = rows[0].id; await loadEdl(); }
+}
+
+async function loadEdl() {
+  const id = $("#edlSelect").value;
+  if (!id) return;
+  EDL = await api(`/api/edls/${id}`);
+  drawEdl();
+}
+
+function drawEdl() {
+  const dur = EDL.items.reduce((t,i) => t + (i.source_end - i.source_start), 0);
+  $("#edlInfo").textContent = `${EDL.items.length} items · ${dur.toFixed(1)}s (target ${EDL.target_duration_s}s)`;
+  $("#edlList").innerHTML = EDL.items.map((it, i) => `<li>
+    <b>${i+1}</b>
+    <span class="grow">seg ${it.clip_id} · ${it.source_start.toFixed(1)}–${it.source_end.toFixed(1)}s
+      <span class="dim">${it.transition_in}→${it.transition_out}</span></span>
+    <button class="act" onclick="selectItem(${i})">select</button>
+  </li>`).join("");
+  document.querySelectorAll("#edlList li").forEach((li, i) =>
+    li.style.borderColor = i === SEL ? "var(--acc)" : "var(--line)");
+}
+
+function selectItem(i) { SEL = i; drawEdl(); }
+function moveEdl(d) {
+  if (SEL < 0 || SEL + d < 0 || SEL + d >= EDL.items.length) return;
+  [EDL.items[SEL], EDL.items[SEL+d]] = [EDL.items[SEL+d], EDL.items[SEL]];
+  SEL += d; drawEdl();
+}
+function removeItem() { if (SEL < 0) return; EDL.items.splice(SEL, 1); SEL = -1; drawEdl(); }
+
+async function saveEdl() {
+  EDL = await api(`/api/edls/${EDL.id}`, {method:"PUT", body:{
+    name: EDL.name, objective: EDL.objective, style: EDL.style, items: EDL.items}});
+  drawEdl();
+}
+
+async function renderEdl() {
+  await saveEdl();
+  $("#renderInfo").textContent = "rendering…";
+  try {
+    const out = await api(`/api/edls/${EDL.id}/render`, {method:"POST"});
+    $("#renderInfo").innerHTML = `rendered ${out.duration_s.toFixed(1)}s — <a href="/renders/${EDL.id}/${EDL.name}.mp4">open preview</a>`;
+    $("#preview").src = `/renders/${EDL.id}/${EDL.name}.mp4`;
+  } catch (e) { $("#renderInfo").textContent = "render failed: " + e.message; }
+}
+
+loadAssets(); loadSegments();
+</script>
+</body>
+</html>
