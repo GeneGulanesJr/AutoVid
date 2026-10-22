@@ -19,7 +19,27 @@ Pipeline (each stage is resumable and logged; originals are never modified):
    rough-cut preview.
 6. **review** — minimal web UI for the catalog and the EDL.
 
-Quick start:
+## The app
+
+Non-technical entry point — one command, one window:
+
+```bash
+.venv/Scripts/pip install -e ".[app]"   # pywebview (native window shell)
+.venv/Scripts/autovid app               # opens the AutoVid window
+```
+
+The window has every step: **Setup** (first-run checks for ffmpeg /
+DecisionMCP / VLM key, and a settings page that writes your `.env` — paste
+your API key there, values are masked after saving), **Pipeline** (pick a
+footage folder, run sample → analyze → cut → organize with live progress),
+**Catalog** (searchable segments), **Review** (approve/reject flagged
+segments), **Music** (pick a song → beat-aligned cut with the music as the
+audio track), **EDL** (edit any plan and re-render). Without pywebview, use
+`autovid app --browser`.
+
+## Quick start (CLI)
+
+Everything the app does is also scriptable:
 
 ```bash
 py -3.10 -m venv .venv

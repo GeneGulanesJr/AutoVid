@@ -27,9 +27,13 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
 ]
+app = [
+    "pywebview>=5.0",
+]
 
 [project.scripts]
 autovid = "autovid.cli:main"
+autovid-app = "autovid.app_main:main"
 
 [build-system]
 requires = ["setuptools>=68"]

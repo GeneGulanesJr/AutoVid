@@ -471,6 +471,22 @@ def musicvideo(
 
 
 @app.command()
+def app(
+    port: int = typer.Option(8766, help="Port for the app server."),
+    browser: bool = typer.Option(False, "--browser", help="Open in a browser tab "
+                                 "instead of a native window (no pywebview needed)."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Launch the AutoVid desktop app (settings, pipeline, review, music)."""
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    from .app import launch
+
+    launch(settings, port=port, window=not browser)
+
+
+@app.command()
 def status(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
