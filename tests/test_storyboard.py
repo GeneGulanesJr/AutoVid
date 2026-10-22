@@ -202,3 +202,43 @@ def test_render_requires_clips(settings: Settings) -> None:
                                              source_start=0, source_end=1)])
     with pytest.raises(AutoVidError, match="unknown segment 999"):
         render_edl(conn, settings, board)
+
+
+def test_budget_counts_trimmed_length_not_source_length(catalog) -> None:
+    """A long segment is trimmed to the style's max, so it must not eat the whole budget."""
+    conn, _, _ = catalog
+    conn.execute("UPDATE segments SET end_s = start_s + 100 "
+                 "WHERE start_s = (SELECT MIN(start_s) FROM segments)")
+    conn.commit()
+    board = select_clips(conn, objective="recap", target_duration_s=20, style="social")
+    assert len(board.items) == 3  # 8 s (trimmed) + 3 s + 3 s still under the 20 s target
+
+
+def test_food_style_one_beat_per_dish_in_meal_order(catalog) -> None:
+    conn, _, _ = catalog
+    foods = [["pork dumplings"], ["noodles"], ["dumpling", "tea"]]
+    for (row_id, resp), f in zip(
+        conn.execute("SELECT id, response_json FROM analyses ORDER BY window_start").fetchall(), foods
+    ):
+        body = json.loads(resp)
+        body.update(foods=f, highlight_score=0.9 if f[0] == "dumpling" else 0.5)
+        conn.execute("UPDATE analyses SET response_json = ? WHERE id = ?", (json.dumps(body), row_id))
+    conn.commit()
+    board = select_clips(conn, objective="food crawl", target_duration_s=30, style="food")
+    # "pork dumplings" folds into "dumpling"; its best window also shows tea, so they share one shot.
+    assert sorted(i.note.lower() for i in board.items) == ["dumpling + tea", "noodles"]
+    assert [i.source_start for i in board.items] == sorted(i.source_start for i in board.items)
+    assert all(i.audio == "clip" for i in board.items)
+
+
+def test_food_style_ignores_dishes_printed_on_a_menu(catalog) -> None:
+    conn, _, _ = catalog
+    rows = conn.execute("SELECT id, response_json FROM analyses ORDER BY window_start").fetchall()
+    for (row_id, resp), (desc, foods) in zip(rows, [("menu board with dishes", ["pizza"]),
+                                                    ("eating", ["noodles"]), ("eating", ["tea"])]):
+        body = json.loads(resp)
+        body.update(description=desc, foods=foods)
+        conn.execute("UPDATE analyses SET response_json = ? WHERE id = ?", (json.dumps(body), row_id))
+    conn.commit()
+    board = select_clips(conn, objective="food crawl", target_duration_s=30, style="food")
+    assert sorted(i.note for i in board.items) == ["noodles", "tea"]

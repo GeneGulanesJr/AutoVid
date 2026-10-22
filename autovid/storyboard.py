@@ -32,6 +32,7 @@ STYLE_CLIP_LENGTHS = {
     "social": (2.0, 8.0),
     "cinematic": (4.0, 12.0),
     "informative": (3.0, 20.0),
+    "food": (2.5, 5.0),
 }
 DEFAULT_STYLE = "cinematic"
 OVERSHOOT_TOLERANCE = 1.2  # never exceed target × this unless the pool is smaller
@@ -112,6 +113,8 @@ def select_clips(
     name: str = "rough-cut",
 ) -> EDL:
     """Build (and persist) an EDL from the accepted-segment catalog."""
+    if style == "food":
+        return _select_food(conn, objective=objective, target_duration_s=target_duration_s, name=name)
     pool = load_candidates(conn)
     if not pool:
         raise ValueError("no accepted segments in the catalog — run the cut stage first")
@@ -123,13 +126,14 @@ def select_clips(
     for cand in ranked:
         if total >= target_duration_s:
             break
-        if total + cand.duration_s > budget and chosen:
+        length = _trim(cand, style)[1] - cand.start_s  # budget the trimmed length we'll actually emit
+        if total + length > budget and chosen:
             continue
         chosen.append(cand)
-        total += cand.duration_s
+        total += length
     if not chosen:  # pool smaller than one budget-safe pick
         chosen = [ranked[0]]
-        total = chosen[0].duration_s
+        total = _trim(chosen[0], style)[1] - chosen[0].start_s
 
     # Ordering: earliest-clip opening, strongest closing, score-ordered middle.
     chosen.sort(key=lambda c: (-c.score, c.start_s))
@@ -161,5 +165,80 @@ def select_clips(
         name=name, objective=objective, style=style,
         target_duration_s=target_duration_s, items=items,
     )
+    edl_mod.save(conn, board)
+    return board
+
+
+def _dish_key(name: str) -> str:
+    n = name.lower().strip()
+    return n[:-1] if n.endswith("s") and not n.endswith("ss") else n
+
+
+def _canonical_dishes(names: set[str]) -> dict[str, str]:
+    """Fold "pork siomai" / "steamed siomai" into "siomai": the shortest listed name it ends with."""
+    toks = {n: n.split() for n in names}
+    return {
+        n: min((m for m, u in toks.items() if t[len(t) - len(u):] == u), key=lambda m: len(toks[m]))
+        for n, t in toks.items()
+    }
+
+
+def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s: float,
+                 name: str) -> EDL:
+    """Food-vlog edit: one shot per distinct dish, in the order it was eaten.
+
+    shortcut: variants fold into the shortest dish name they end with ("shrimp siomai" ->
+    "siomai"), and the shot is the first seconds of the dish's best window because the VLM
+    says which dishes a window shows, not when. Upgrade: per-frame dish timing, finer variants.
+    """
+    lo, hi = STYLE_CLIP_LENGTHS["food"]
+    pool = load_candidates(conn)
+    if not pool:
+        raise ValueError("no accepted segments in the catalog — run the cut stage first")
+    rows = conn.execute(
+        """SELECT an.asset_id, an.window_start, an.window_end, an.response_json, a.original_name
+           FROM analyses an JOIN assets a ON a.id = an.asset_id
+           ORDER BY a.original_name, an.window_start"""
+    ).fetchall()
+    hits = []  # (quality, dish, shot) for every food seen in a usable window
+    for r in rows:
+        try:
+            a = json.loads(r["response_json"])
+        except ValueError:
+            continue
+        if "menu" in (a.get("description") or "").lower():
+            continue  # shortcut: the VLM lists dishes printed on a menu board; skip those windows
+        quality = float(a.get("highlight_score") or 0) * (1 - float(a.get("uncertainty") or 0))
+        seg = next((c for c in pool if c.asset_id == r["asset_id"]
+                    and c.start_s <= r["window_start"] < c.end_s), None)
+        end = min(r["window_start"] + hi, r["window_end"], seg.end_s) if seg else 0.0
+        if seg is None or end - r["window_start"] < lo:
+            continue
+        shot = (r["original_name"], r["window_start"], end, seg.segment_id, r["asset_id"])
+        hits += [(quality, food.strip(), shot) for food in a.get("foods") or [] if food.strip()]
+    if not hits:
+        raise ValueError("no foods found — re-run analyze (with a short AUTOVID_COARSE_WINDOW_S) "
+                         "after the foods update")
+    canon = _canonical_dishes({_dish_key(h[1]) for h in hits})
+    best: dict[str, tuple[float, str, tuple]] = {}  # dish -> its best hit
+    for q, food, shot in hits:
+        key = canon[_dish_key(food)]
+        if key not in best or q > best[key][0]:
+            best[key] = (q, food, shot)
+    windows: dict[tuple, dict] = {}  # one shot per window, labelled with every dish it was picked for
+    for q, food, shot in best.values():
+        w = windows.setdefault(shot, {"quality": 0.0, "dishes": []})
+        w["quality"] = max(w["quality"], q)
+        w["dishes"].append(food)
+    shots = sorted(windows.items(), key=lambda kv: -kv[1]["quality"])
+    budget = target_duration_s * OVERSHOOT_TOLERANCE
+    while sum(sh[2] - sh[1] for sh, _ in shots) > budget and len(shots) > 1:
+        shots.pop()  # drop the weakest shot
+    shots.sort(key=lambda kv: (kv[0][0], kv[0][1]))  # meal order: file name is capture time
+    items = [EDLItem(clip_id=sh[3], asset_id=sh[4], source_start=round(sh[1], 3),
+                     source_end=round(sh[2], 3), note=" + ".join(w["dishes"]), audio="clip")
+             for sh, w in shots]
+    board = EDL(name=name, objective=objective, style="food",
+                target_duration_s=target_duration_s, items=items)
     edl_mod.save(conn, board)
     return board

@@ -163,3 +163,25 @@ def test_decisionmcp_autostart_skips_remote_and_heuristic() -> None:
 
     assert _start_decisionmcp(Settings(decisionmcp_url="http://example.com:8765/mcp")) is None
     assert _start_decisionmcp(Settings(decision_mode="heuristic")) is None
+
+
+def test_cli_prints_arrows_on_cp1252_console() -> None:
+    import os
+    import subprocess
+    import sys
+
+    code = "from autovid import cli; cli._utf8_stdio(); cli.console.print('3 windows → 2 scenes')"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+
+
+def test_cli_prints_arrows_on_cp1252_console() -> None:
+    import os
+    import subprocess
+    import sys
+
+    code = "from autovid import cli; cli._utf8_stdio(); cli.console.print('3 windows → 2 scenes')"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
