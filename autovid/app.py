@@ -7,7 +7,9 @@ talking to the same JSON API.
 """
 from __future__ import annotations
 
+import atexit
 import logging
+import subprocess
 import threading
 import time
 import webbrowser
@@ -30,6 +32,7 @@ def launch(settings: Settings | None = None, *, port: int = DEFAULT_PORT,
 
     from .web import create_app
 
+    _start_decisionmcp(settings)
     app = create_app(settings)
     server = threading.Thread(
         target=lambda: uvicorn.run(app, host="127.0.0.1", port=port,
@@ -60,6 +63,36 @@ def launch(settings: Settings | None = None, *, port: int = DEFAULT_PORT,
         time.sleep(1)
 
 
+def _start_decisionmcp(settings: Settings) -> subprocess.Popen | None:
+    """Spawn the sibling ../DecisionMCP server if the decision layer is local and down.
+
+    shortcut: Windows venv layout and a fixed sibling folder, make the path
+    configurable if DecisionMCP lives elsewhere.
+    """
+    import httpx
+    from urllib.parse import urlparse
+
+    url = urlparse(settings.decisionmcp_url)
+    if url.hostname not in ("127.0.0.1", "localhost") or settings.decision_mode == "heuristic":
+        return None
+    health = f"{url.scheme}://{url.netloc}/health"
+    try:
+        if httpx.get(health, timeout=1.0).status_code == 200:
+            return None
+    except Exception:  # noqa: BLE001 — not running, try to start it
+        pass
+    root = Path(__file__).resolve().parent.parent.parent / "DecisionMCP"
+    exe = root / ".venv" / "Scripts" / "decisionmcp.exe"
+    if not exe.exists():
+        logger.info("DecisionMCP not found at %s — heuristic fallbacks stay active", exe)
+        return None
+    proc = subprocess.Popen([str(exe)], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    atexit.register(proc.terminate)  # we started it, we stop it
+    _wait_ready(health, timeout_s=90.0)  # model load takes a few seconds
+    return proc
+
+
 def _wait_ready(url: str, timeout_s: float = 20.0) -> None:
     import httpx
 
@@ -76,10 +109,11 @@ def _wait_ready(url: str, timeout_s: float = 20.0) -> None:
 def write_launcher_script(data_dir: Path) -> Path:
     """A double-clickable Windows launcher for non-technical use."""
     script = data_dir / "AutoVid.bat"
-    venv_python = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe"
+    # pythonw: no console window behind the app.
+    venv_python = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "pythonw.exe"
     script.write_text(
         "@echo off\r\n"
-        f"start \"AutoVid\" \"{venv_python}\" -m autovid.app\r\n",
+        f"start \"\" \"{venv_python}\" -m autovid.app_main\r\n",
         encoding="utf-8",
     )
     return script

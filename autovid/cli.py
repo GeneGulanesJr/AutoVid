@@ -470,19 +470,24 @@ def musicvideo(
     console.print(f"[green]Rendered:[/green] {out}")
 
 
-@app.command()
-def app(
+@app.command("app")
+def app_cmd(
     port: int = typer.Option(8766, help="Port for the app server."),
     browser: bool = typer.Option(False, "--browser", help="Open in a browser tab "
                                  "instead of a native window (no pywebview needed)."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+    make_launcher: bool = typer.Option(False, "--make-launcher", help="Write a "
+                                       "double-clickable AutoVid.bat to the Desktop and exit."),
 ) -> None:
     """Launch the AutoVid desktop app (settings, pipeline, review, music)."""
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
-    from .app import launch
+    from .app import launch, write_launcher_script
 
+    if make_launcher:
+        console.print(f"[green]Launcher:[/green] {write_launcher_script(Path.home() / 'Desktop')}")
+        return
     launch(settings, port=port, window=not browser)
 
 
