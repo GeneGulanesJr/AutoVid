@@ -1,0 +1,22 @@
+# runtime data + heavy tools
+catalog/
+.tools/
+.venv/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# secrets
+.env
+
+# ZCode planning artifacts
+.zcode/
+
+# local test footage/artifacts
+.e2e/
+probe_tmp/

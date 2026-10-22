@@ -1,0 +1,43 @@
+[project]
+name = "autovid"
+version = "0.1.0"
+description = "AI-powered automatic video editor: ingest, understand, organize, and rough-cut raw footage."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "pillow>=10.4",
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    # Match DecisionMCP's server SDK generation (its client API differs in 2.x).
+    "mcp>=1.9,<2",
+    # Music-driven editing: beat/tempo/energy analysis.
+    "librosa>=0.10",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+autovid = "autovid.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["autovid*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
