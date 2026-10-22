@@ -149,3 +149,17 @@ def test_pipeline_ingest_job_runs_to_done(settings: Settings, tmp_path: Path) ->
 def test_stage_endpoint_rejects_unknown_stage(settings: Settings, client: TestClient) -> None:
     r = client.post("/api/pipeline/wat", json={})
     assert r.status_code == 400
+
+
+def test_launcher_runs_the_real_entry_point(tmp_path: Path) -> None:
+    from autovid.app import write_launcher_script
+
+    text = write_launcher_script(tmp_path).read_text(encoding="utf-8")
+    assert "-m autovid.app_main" in text and "pythonw.exe" in text
+
+
+def test_decisionmcp_autostart_skips_remote_and_heuristic() -> None:
+    from autovid.app import _start_decisionmcp
+
+    assert _start_decisionmcp(Settings(decisionmcp_url="http://example.com:8765/mcp")) is None
+    assert _start_decisionmcp(Settings(decision_mode="heuristic")) is None
