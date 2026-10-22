@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import sys
 from pathlib import Path
 
 import typer
@@ -526,7 +528,22 @@ def status(
     console.print(table)
 
 
+def _utf8_stdio() -> None:
+    # Windows consoles default to cp1252, which can't print the arrows in our output.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _utf8_stdio() -> None:  # Windows consoles default to cp1252, which can't print our arrows.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    _utf8_stdio()
+    _utf8_stdio()
     app()
 
 

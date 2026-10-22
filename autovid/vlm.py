@@ -39,6 +39,8 @@ class WindowAnalysis(BaseModel):
     description: str = Field(..., min_length=1)
     activity: str | None = None
     objects: list[str] = Field(default_factory=list)
+    # Dishes/drinks that are the subject of the shot (not tableware); empty if not food footage.
+    foods: list[str] = Field(default_factory=list)
     environment: str | None = None
     camera_motion: Literal["static", "pan", "tilt", "zoom", "handheld", "dolly", "other"] | None = (
         None
@@ -53,6 +55,9 @@ Answer with STRICT JSON only (no markdown, no prose) with exactly these keys:
 "description": one or two factual sentences about what happens in this window;
 "activity": the main activity or null;
 "objects": notable visible objects (list of short strings);
+"foods": specific dishes or drinks that are the subject of these frames, named \
+as a menu would (e.g. "pork siomai", "iced milk tea"); only real food or drink physically \
+present, not pictures on menus, signs or posters, and not tableware; [] if none;
 "environment": the setting/location type or null;
 "camera_motion": one of static|pan|tilt|zoom|handheld|dolly|other or null;
 "highlight_score": 0.0-1.0, how much a rough cut should want this window;
