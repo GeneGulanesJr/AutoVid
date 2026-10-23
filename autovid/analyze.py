@@ -234,7 +234,15 @@ def analyze_asset(
                 """INSERT INTO analyses (asset_id, window_start, window_end, provider,
                                          model, response_json, prompt_tokens,
                                          completion_tokens, confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(asset_id, window_start) DO UPDATE SET
+                       window_end = excluded.window_end,
+                       provider = excluded.provider,
+                       model = excluded.model,
+                       response_json = excluded.response_json,
+                       prompt_tokens = excluded.prompt_tokens,
+                       completion_tokens = excluded.completion_tokens,
+                       confidence = excluded.confidence""",
                 (
                     asset_id, start, end,
                     settings.vlm_model if analysis else "none",
