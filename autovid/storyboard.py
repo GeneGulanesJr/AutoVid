@@ -16,6 +16,7 @@ Deterministic: same catalog + same inputs → same EDL.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import sqlite3
@@ -145,10 +146,10 @@ def select_clips(
     remaining = sorted(middle, key=lambda c: (-c.score, c.start_s))
     while remaining:
         prev = ordered[-1]
-        alt = next((c for c in remaining if not _similar(prev, c)), None)
-        pick = alt if alt is not None else remaining[0]
-        ordered.append(pick)
-        remaining.remove(pick)
+        idx = next((i for i, c in enumerate(remaining) if not _similar(prev, c)), None)
+        pick_i = idx if idx is not None else 0
+        ordered.append(remaining[pick_i])
+        del remaining[pick_i]
     if closer is not opener:
         ordered.append(closer)
 
@@ -195,6 +196,15 @@ def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s:
     pool = load_candidates(conn)
     if not pool:
         raise ValueError("no accepted segments in the catalog — run the cut stage first")
+    # candidates grouped per asset, sorted by start — window lookup bisects
+    # instead of scanning the whole pool per analysis row
+    by_asset: dict[str, list] = {}
+    for c in pool:
+        by_asset.setdefault(c.asset_id, []).append(c)
+    starts_by_asset: dict[str, list[float]] = {}
+    for aid, cands in by_asset.items():
+        cands.sort(key=lambda c: c.start_s)
+        starts_by_asset[aid] = [c.start_s for c in cands]
     rows = conn.execute(
         """SELECT an.asset_id, an.window_start, an.window_end, an.response_json, a.original_name
            FROM analyses an JOIN assets a ON a.id = an.asset_id
@@ -209,8 +219,12 @@ def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s:
         if "menu" in (a.get("description") or "").lower():
             continue  # shortcut: the VLM lists dishes printed on a menu board; skip those windows
         quality = float(a.get("highlight_score") or 0) * (1 - float(a.get("uncertainty") or 0))
-        seg = next((c for c in pool if c.asset_id == r["asset_id"]
-                    and c.start_s <= r["window_start"] < c.end_s), None)
+        seg = None
+        cands = by_asset.get(r["asset_id"])
+        if cands:
+            i = bisect.bisect_right(starts_by_asset[r["asset_id"]], r["window_start"]) - 1
+            if i >= 0 and cands[i].start_s <= r["window_start"] < cands[i].end_s:
+                seg = cands[i]
         end = min(r["window_start"] + hi, r["window_end"], seg.end_s) if seg else 0.0
         if seg is None or end - r["window_start"] < lo:
             continue
@@ -232,7 +246,9 @@ def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s:
         w["dishes"].append(food)
     shots = sorted(windows.items(), key=lambda kv: -kv[1]["quality"])
     budget = target_duration_s * OVERSHOOT_TOLERANCE
-    while sum(sh[2] - sh[1] for sh, _ in shots) > budget and len(shots) > 1:
+    total = sum(sh[2] - sh[1] for sh, _ in shots)
+    while total > budget and len(shots) > 1:
+        total -= shots[-1][2] - shots[-1][1]
         shots.pop()  # drop the weakest shot
     shots.sort(key=lambda kv: (kv[0][0], kv[0][1]))  # meal order: file name is capture time
     items = [EDLItem(clip_id=sh[3], asset_id=sh[4], source_start=round(sh[1], 3),

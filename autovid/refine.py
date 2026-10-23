@@ -25,6 +25,7 @@ All timestamps remain on the original source timeline.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -139,19 +140,41 @@ def segment_scenes(
     if not wins:
         return [], stats
 
-    cuts = [
+    # One pass over the asset's frames (sorted by ts); the continuity loop
+    # bisects this instead of issuing two SQL lookups per window pair.
+    frame_ts: list[float] = []
+    frame_path: dict[float, str] = {}
+    for r in conn.execute(
+        "SELECT ts, path FROM frames WHERE asset_id = ? AND kind IN ('grid', 'dense') "
+        "ORDER BY ts",
+        (asset_id,),
+    ).fetchall():
+        ts = float(r["ts"])
+        frame_ts.append(ts)
+        frame_path[ts] = r["path"]
+
+    def frame_before(t: float) -> str | None:
+        i = bisect.bisect_left(frame_ts, t)
+        return frame_path[frame_ts[i - 1]] if i else None
+
+    def frame_at_or_after(t: float) -> str | None:
+        i = bisect.bisect_left(frame_ts, t)
+        return frame_path[frame_ts[i]] if i < len(frame_ts) else None
+
+    cuts = sorted(
         float(r["start_s"])
         for r in conn.execute(
             "SELECT start_s FROM scenes WHERE asset_id = ? AND source LIKE 'scdet%'",
             (asset_id,),
         ).fetchall()
-    ]
+    )
 
     def near_cut(boundary: float) -> tuple[bool, float | None]:
         if not cuts:
             return False, None
-        dist, ts = min((abs(boundary - c), c) for c in cuts)
-        return dist <= REFINE_WINDOW_S, ts
+        i = bisect.bisect_left(cuts, boundary)
+        nearest = min(cuts[max(0, i - 1):i + 1], key=lambda c: abs(boundary - c))
+        return abs(boundary - nearest) <= REFINE_WINDOW_S, nearest
 
     def summarize(w: dict) -> dict:
         d = w["data"]
@@ -175,18 +198,10 @@ def segment_scenes(
             "detector_cut_near_boundary": is_near,
         })
         images = None
-        left_frames = conn.execute(
-            "SELECT path FROM frames WHERE asset_id = ? AND kind IN ('grid','dense') "
-            "AND ts < ? ORDER BY ts DESC LIMIT 1",
-            (asset_id, left["end"]),
-        ).fetchone()
-        right_frames = conn.execute(
-            "SELECT path FROM frames WHERE asset_id = ? AND kind IN ('grid','dense') "
-            "AND ts >= ? ORDER BY ts LIMIT 1",
-            (asset_id, right["start"]),
-        ).fetchone()
-        if left_frames and right_frames:
-            images = [b64_jpeg(left_frames["path"]), b64_jpeg(right_frames["path"])]
+        left_path = frame_before(left["end"])
+        right_path = frame_at_or_after(right["start"])
+        if left_path and right_path:
+            images = [b64_jpeg(left_path), b64_jpeg(right_path)]
 
         verdict = decisions.decide_continuity(
             asset_id, context, images, near_cut=is_near
@@ -244,10 +259,12 @@ def segment_scenes(
             if w["data"].get("description") and not w["data"].get("error")
         ]
         tags: list[str] = []
+        seen: set[str] = set()
         for w in group:
             for o in w["data"].get("objects") or []:
                 t = str(o).strip().lower()
-                if t and t not in tags:
+                if t and t not in seen:
+                    seen.add(t)
                     tags.append(t)
         highlight = max(
             (float(w["data"].get("highlight_score") or 0.0) for w in group
