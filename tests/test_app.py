@@ -24,9 +24,8 @@ from autovid.settings_store import (
 def test_mask_secret() -> None:
     assert mask_secret("") == ""
     assert mask_secret("short") == "••••"
-    masked = mask_secret("abcdefghijklmnop")
-    assert masked.startswith("abcd")
-    assert "bcdefghijklmn" not in masked
+    # set/unset only — the masked view never leaks key material
+    assert mask_secret("abcdefghijklmnop") == "••••"
 
 
 def test_upsert_preserves_comments_and_updates_values(tmp_path: Path) -> None:
@@ -56,7 +55,8 @@ def test_current_settings_view_masks_secrets(settings: Settings) -> None:
     settings = settings.model_copy(update={"vlm_api_key": "supersecretkey123"})
     view = current_settings_view(settings)
     flat = {f["key"]: f for g in view["groups"] for f in g["fields"]}
-    assert flat["AUTOVID_VLM_API_KEY"]["value"].startswith("supe")
+    assert flat["AUTOVID_VLM_API_KEY"]["value"] == "••••"
+    assert flat["AUTOVID_VLM_API_KEY"]["set"] is True
     assert "supersecretkey123" not in flat["AUTOVID_VLM_API_KEY"]["value"]
     assert set(flat) == EDITABLE_KEYS
 

@@ -212,14 +212,16 @@ async function loadSetup() {
   const cfg = await api("/api/settings");
   $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${esc(g.group)}</h4>` +
     g.fields.map(f => `<div class="field"><label>${esc(f.label)}</label>
-      <input id="set_${f.key}" value="${esc(f.value)}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
+      <input id="set_${f.key}" value="${esc(f.value)}" data-orig="${esc(f.value)}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
       <span class="hint">${esc(f.help || "")} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
 }
 async function saveSettings() {
   const values = {};
   document.querySelectorAll("[id^='set_']").forEach(inp => {
     const key = inp.id.slice(4);
-    if (inp.value !== "" ) values[key] = inp.value;   // empty = leave unchanged
+    // only fields the user actually changed — masked secrets (and any
+    // untouched field) must never be written back over the real value
+    if (inp.value !== "" && inp.value !== inp.dataset.orig) values[key] = inp.value;
   });
   await api("/api/settings", {method:"PUT", body:{values}});
   $("#settingsMsg").textContent = "saved " + new Date().toLocaleTimeString();

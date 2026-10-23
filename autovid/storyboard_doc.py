@@ -226,6 +226,16 @@ def save_script(conn: sqlite3.Connection, script: ScriptDocument, *,
             ):
                 changed_beats.add(beat.id)
 
+    # Stale flags are applied to the in-memory document and land in the NEW
+    # version only (appended below) — stored versions are never rewritten, so
+    # restoring an old version restores exactly what was saved then.
+    document, _ = load_document(conn, script.storyboard_id)
+    stale_scene_ids = {s.id for s in document.scenes if s.beat_id in changed_beats}
+    if stale_scene_ids:
+        for scene in document.scenes:
+            if scene.id in stale_scene_ids:
+                scene.stale = True
+
     conn.execute(
         """INSERT INTO scripts (id, storyboard_id, title, synopsis, beats_json, origin,
                                 created_at, updated_at)
@@ -239,13 +249,8 @@ def save_script(conn: sqlite3.Connection, script: ScriptDocument, *,
             json.dumps([b.model_dump() for b in script.beats]), script.origin,
         ),
     )
-    for scene_id in {s.id for s in
-                     load_document(conn, script.storyboard_id)[0].scenes
-                     if s.beat_id in changed_beats}:
-        _mark_scene(conn, script.storyboard_id, scene_id, stale=True)
     if bump_version and changed_beats:
-        doc, _ = load_document(conn, script.storyboard_id)
-        save_document(conn, script.storyboard_id, doc,
+        save_document(conn, script.storyboard_id, document,
                       origin="script_edit",
                       note=f"script changed for beats {sorted(changed_beats)}")
     conn.commit()
@@ -262,21 +267,6 @@ def load_script(conn: sqlite3.Connection, storyboard_id: str) -> ScriptDocument 
         title=row["title"], synopsis=row["synopsis"],
         beats=[ScriptBeat.model_validate(b) for b in json.loads(row["beats_json"] or "[]")],
         origin=row["origin"],
-    )
-
-
-def _mark_scene(conn: sqlite3.Connection, storyboard_id: str, scene_id: str, *,
-                stale: bool) -> None:
-    """Flip a flag inside the current version's document (history untouched —
-    the flag change itself is recorded by the caller's version bump)."""
-    doc, version = load_document(conn, storyboard_id)
-    for scene in doc.scenes:
-        if scene.id == scene_id:
-            scene.stale = stale
-    conn.execute(
-        "UPDATE storyboard_versions SET document_json = ? "
-        "WHERE storyboard_id = ? AND version = ?",
-        (doc.model_dump_json(), storyboard_id, version),
     )
 
 

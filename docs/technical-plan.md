@@ -27,7 +27,7 @@ catalog.
 | Decision layer | Separate repo **DecisionMCP**, streamable-HTTP MCP at `http://127.0.0.1:8765/mcp`; 21 tools, `d1-omni-tf` engine (LiquidAI/d1-omni-600M, transformers, CUDA/CPU) | Established |
 | Primary vision model | OpenAI-compatible cloud VLM (`AUTOVID_VLM_*`, default Z.ai glm-4.6v); any local VLM server drop-in via the same interface | Established / local VLM to benchmark |
 | Music analysis | librosa (beats, tempo, downbeat phase, RMS energy, energy sections) — deliberately **not** a model | Established |
-| Catalog | Single SQLite DB (`catalog/`), `PRAGMA user_version` schema (v3) with in-place auto-migration, WAL + `synchronous=NORMAL` | Established |
+| Catalog | Single SQLite DB (`catalog/`), `PRAGMA user_version` schema (v4) with in-place auto-migration, WAL + `synchronous=NORMAL` | Established |
 | Media tools | ffmpeg/ffprobe 9.0.2, resolution chain `AUTOVID_FFMPEG_DIR` → `PATH` → vendored `.tools/ffmpeg*/bin` (winget is blocked by policy on this machine) | Established |
 | Storyboard planning | Generative **Storyboard Agent** over a catalog digest (one repair round, then deterministic planner fallback); the deterministic planner also runs standalone | Established |
 | UI | Setup / Pipeline / Catalog / Review / **Storyboard** / Music / EDL pages; scene cards, script editor, version history, approve→compile | Established |
@@ -196,7 +196,7 @@ short-circuits on hash, and re-renders re-extract only the edited item.
 
 ## 4. Data Models & Structured Output Schemas
 
-### 4.1 Catalog (SQLite, schema v3, versioned via `user_version`, in-place auto-migration)
+### 4.1 Catalog (SQLite, schema v4, versioned via `user_version`, in-place auto-migration)
 
 | Table | Holds |
 |---|---|
@@ -378,7 +378,11 @@ fallbacks throughout; benchmark harness.
    item-level error/warning reporting, render gate.
 4. **Scale benchmark round** (phases 3+9): bench on real heterogeneous
    footage; decide d1's per-decision-type defaults from measured
-   F1-vs-cost.
+   F1-vs-cost. *Harness validated 2026-10-23 on a synthetic heterogeneous
+   fixture (docs/bench-synthetic-first-pass.md): boundary F1 = 1.00 for both
+   modes, heuristic adaptivity cuts would-be VLM frames 61→46, d1 on CPU
+   re-measured at ~13.8 s/window with no gain on unambiguous cuts. The
+   real-footage round with human ground truth remains the gate.*
 5. **Nice-to-have, explicitly unpromised:** audio transcription (local
    Whisper) as a segment metadata field; FTS5 search; embedding search;
    drag-and-drop reordering; music-summary input to the agent.
