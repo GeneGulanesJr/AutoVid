@@ -208,12 +208,12 @@ const pill = (t, c) => `<span class="pill ${c||''}">${t}</span>`;
 async function loadSetup() {
   const s = await api("/api/setup");
   $("#setupChecks").innerHTML = s.checks.map(c =>
-    `<div class="check">${c.ok ? pill("OK","ok") : pill("missing","bad")} <b>${c.name}</b> <span class="dim">${c.detail}</span></div>`).join("");
+    `<div class="check">${c.ok ? pill("OK","ok") : pill("missing","bad")} <b>${esc(c.name)}</b> <span class="dim">${esc(c.detail)}</span></div>`).join("");
   const cfg = await api("/api/settings");
-  $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${g.group}</h4>` +
-    g.fields.map(f => `<div class="field"><label>${f.label}</label>
-      <input id="set_${f.key}" value="${f.value}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
-      <span class="hint">${f.help || ""} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
+  $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${esc(g.group)}</h4>` +
+    g.fields.map(f => `<div class="field"><label>${esc(f.label)}</label>
+      <input id="set_${f.key}" value="${esc(f.value)}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
+      <span class="hint">${esc(f.help || "")} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
 }
 async function saveSettings() {
   const values = {};
@@ -254,10 +254,10 @@ function watch(id, onDone) {
 function drawJob(j) {
   const pct = j.total ? Math.round(100 * j.done / j.total) : 0;
   $("#jobsPanel").innerHTML = `<div class="jobbox">
-    <b>${j.stage}</b> ${pill(j.state, j.state === "done" ? "ok" : j.state === "error" ? "bad" : "warn")}
-    <span class="dim">${j.done}/${j.total || "?"} ${j.current}</span>
+    <b>${esc(j.stage)}</b> ${pill(j.state, j.state === "done" ? "ok" : j.state === "error" ? "bad" : "warn")}
+    <span class="dim">${j.done}/${j.total || "?"} ${esc(j.current)}</span>
     <div class="bar"><i style="width:${pct}%"></i></div>
-    <div class="log">${(j.log || []).join("\n")}${j.error ? "\nERROR: " + j.error : ""}</div></div>`;
+    <div class="log">${esc((j.log || []).join("\n"))}${j.error ? "\nERROR: " + esc(j.error) : ""}</div></div>`;
 }
 async function refreshJobs() { /* jobs are ephemeral; panel redraws while watching */ }
 
@@ -265,7 +265,7 @@ async function refreshJobs() { /* jobs are ephemeral; panel redraws while watchi
 async function loadAssets() {
   const rows = await api("/api/assets");
   $("#assetTable tbody").innerHTML = rows.map(a => `<tr>
-    <td class="dim">${a.id}</td><td>${a.name}</td>
+    <td class="dim">${esc(a.id)}</td><td>${esc(a.name)}</td>
     <td>${pill(a.status, a.status === "error" ? "bad" : ["cut","organized"].includes(a.status) ? "ok" : "warn")}</td>
     <td>${a.duration_s.toFixed(1)}s</td><td>${a.segments}</td><td>${a.decisions}</td>
     <td>${a.duplicates.length || ""}</td></tr>`).join("");
@@ -278,8 +278,8 @@ async function loadSegments() {
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict || "—", s.verdict === "accept" ? "ok" : s.verdict === "reject" ? "bad" : "warn")}</td>
     <td>${s.highlight_score == null ? "" : s.highlight_score.toFixed(2)}</td>
-    <td>${s.description || ""}</td>
-    <td class="dim">${JSON.parse(s.tags_json || "[]").join(", ")}</td>
+    <td>${esc(s.description || "")}</td>
+    <td class="dim">${esc(JSON.parse(s.tags_json || "[]").join(", "))}</td>
     <td>${s.clip_path ? `<a href="/clips/${s.id}" target="_blank">clip</a>` : ""}</td></tr>`).join("");
 }
 async function loadReview() {
@@ -288,7 +288,7 @@ async function loadReview() {
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict, "warn")}</td>
     <td>${s.decision_confidence == null ? "" : s.decision_confidence.toFixed(2)}</td>
-    <td>${s.description || ""}</td>
+    <td>${esc(s.description || "")}</td>
     <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted preload="none"></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
     <td><div class="row-actions">
       <button class="act" onclick="review(${s.id},'approved')">approve</button>
@@ -313,7 +313,7 @@ async function planMusic() {
       $("#musicInfo").innerHTML =
         `${out.items} cuts over ${out.duration_s.toFixed(1)}s @ ${Math.round(out.tempo_bpm)} BPM` +
         (out.render_path ? ` — <a href="/renders/${out.edl_id}/music-cut.mp4">open render</a>` :
-         out.render_error ? " (render failed: " + out.render_error + ")" : "");
+         out.render_error ? " (render failed: " + esc(out.render_error) + ")" : "");
       if (out.render_path) $("#musicPreview").src = `/renders/${out.edl_id}/music-cut.mp4`;
       loadEdlList();
     });
@@ -323,7 +323,7 @@ async function planMusic() {
 // ---- EDL editor ----
 async function loadEdlList() {
   const rows = await api("/api/edls");
-  $("#edlSelect").innerHTML = rows.map(e => `<option value="${e.id}">${e.name} (${e.id})</option>`).join("")
+  $("#edlSelect").innerHTML = rows.map(e => `<option value="${e.id}">${esc(e.name)} (${e.id})</option>`).join("")
     || '<option value="">no EDLs yet</option>';
   if (rows.length) { $("#edlSelect").value = rows[0].id; await loadEdl(); }
 }
@@ -338,7 +338,7 @@ function drawEdl() {
     <b>${i+1}</b>
     <span class="grow">seg ${it.clip_id} · src ${it.source_start.toFixed(1)}–${it.source_end.toFixed(1)}s
       ${it.timeline_start != null ? `· tl ${it.timeline_start.toFixed(1)}s` : ""}
-      <span class="dim">${it.beat_ref || ""}</span></span>
+      <span class="dim">${esc(it.beat_ref || "")}</span></span>
     <button class="act" onclick="selectItem(${i})">select</button></li>`).join("");
   document.querySelectorAll("#edlList li").forEach((li, i) =>
     li.style.borderColor = i === SEL ? "var(--acc)" : "var(--line)");
@@ -366,9 +366,12 @@ async function renderEdl() {
         $("#renderInfo").textContent = "render failed: " + (done.error || "unknown error");
         return;
       }
-      const name = `${EDL.name}.mp4`;
-      $("#renderInfo").innerHTML = `rendered ${(out.duration_s || 0).toFixed(1)}s — <a href="/renders/${EDL.id}/${name}">open</a>`;
-      $("#preview").src = `/renders/${EDL.id}/${name}`;
+      // the server returns the real output path — the on-disk name is the
+      // EDL name, slugified, not the display name verbatim
+      const fname = out.path.split(/[\\/]/).pop();
+      const url = `/renders/${EDL.id}/${encodeURIComponent(fname)}`;
+      $("#renderInfo").innerHTML = `rendered ${(out.duration_s || 0).toFixed(1)}s — <a href="${url}">open</a>`;
+      $("#preview").src = url;
     });
   } catch (e) { $("#renderInfo").textContent = "render failed: " + e.message; }
 }
@@ -384,7 +387,10 @@ async function validateEdl() {
 
 // ---- storyboard (Script · Storyboard · EDL) ----
 let SB = null, SB_SEGS = [];
-const esc = (t) => String(t ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+// Escape for HTML text/attribute context — everything interpolated into
+// innerHTML that came from a file name, VLM/LLM output, or user input goes
+// through this.
+const esc = (t) => String(t ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 const segOf = (id) => SB_SEGS.find(s => s.id === id);
 async function loadBoardView() {
   SB_SEGS = await api("/api/segments");
@@ -393,7 +399,7 @@ async function loadBoardView() {
 async function loadBoardList() {
   const rows = await api("/api/storyboards");
   $("#sbSelect").innerHTML = rows.map(b =>
-    `<option value="${b.id}">${b.name} (${b.id})</option>`).join("")
+    `<option value="${b.id}">${esc(b.name)} (${b.id})</option>`).join("")
     || '<option value="">no storyboards yet</option>';
   if (rows.length) { $("#sbSelect").value = rows[0].id; await loadBoard(); }
   else {
@@ -460,7 +466,7 @@ function drawBoard() {
               return `<option value="${a}">seg ${a}${sa ? " — " + esc((sa.description||"").slice(0,60)) : ""}</option>`; }).join("")}
           </select>
           <button class="act" onclick="swapAlternate(${i})">swap</button>
-          <button class="act" onclick="regenScene('${esc(s.id)}')">✦ regen</button>
+          <button class="act" onclick="regenScene(${i})">✦ regen</button>
           <button class="act" onclick="moveScene(${i},-1)">↑</button>
           <button class="act" onclick="moveScene(${i},1)">↓</button>
           <button class="act" onclick="removeScene(${i})">✕</button>
@@ -520,7 +526,10 @@ async function saveScript() {
     await loadBoard();
   } catch (e) { $("#scriptMsg").textContent = "failed: " + e.message; }
 }
-async function regenScene(sceneId) {
+async function regenScene(i) {
+  // scene ids are free-form (API/LLM-settable) — resolve by index, never by
+  // splicing them into an inline JS string
+  const sceneId = SB.document.scenes[i].id;
   $("#sbMsg").textContent = "regenerating " + sceneId + "…";
   try {
     const j = await api(`/api/storyboards/${SB.id}/regenerate`,

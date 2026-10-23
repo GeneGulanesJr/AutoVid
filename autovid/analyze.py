@@ -194,7 +194,7 @@ def analyze_asset(
                         settings.assets_dir / asset_id / "dense"
                         / f"insp_{start:.3f}_{ts:.3f}.jpg"
                     )
-                    p_path = frame_at(source, ts, path, width=512)
+                    p_path = frame_at(source, ts, path, width=512)[1]
                     conn.execute(
                         "INSERT OR IGNORE INTO frames (asset_id, ts, kind, path) "
                         "VALUES (?, ?, 'dense', ?)",

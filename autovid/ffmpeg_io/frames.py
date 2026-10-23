@@ -77,7 +77,7 @@ def extract_periodic_frames(
     )
     try:
         stderr = _run([
-            ffmpeg_path(), "-y", "-v", "info",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "info",
             *seek,
             "-i", str(source),
             "-vf", vf,
@@ -131,7 +131,7 @@ def extract_grid_and_scene_changes(
     )
     try:
         stderr = _run([
-            ffmpeg_path(), "-y", "-v", "info",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "info",
             "-i", str(source),
             "-filter_complex", filter_complex,
             "-map", "[gout]", "-fps_mode", "vfr", str(pattern),
@@ -157,14 +157,18 @@ def extract_grid_and_scene_changes(
 
 def frame_at(
     source: str | Path, ts: float, out_path: Path, *, width: int | None = None
-) -> Path:
-    """Extract the single frame at ``ts`` seconds (output-seek, exact)."""
+) -> tuple[float, Path]:
+    """Extract the single frame at ``ts`` seconds; returns ``(ts, out_path)``.
+
+    Input seeking resets ffmpeg's timestamps, so the frame's true source
+    timestamp is the requested ``ts`` itself.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [ffmpeg_path(), "-y", "-v", "error", "-ss", f"{ts:.3f}", "-i", str(source)]
+    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-ss", f"{ts:.3f}", "-i", str(source)]
     if width:
         cmd += ["-vf", f"scale={width}:-2"]
     cmd += ["-frames:v", "1", str(out_path)]
     _run(cmd)
     if not out_path.exists():
         raise AutoVidError(f"no frame at t={ts:.3f}s in {source}")
-    return out_path
+    return ts, out_path

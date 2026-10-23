@@ -78,7 +78,7 @@ def detect_scene_changes(
     which produces the same detections from a shared decode.
     """
     cmd = [
-        ffmpeg_path(), "-v", "info",
+        ffmpeg_path(), "-nostdin", "-v", "info",
         "-i", str(source),
         "-vf", f"select='gt(scene,{threshold})',metadata=print",
         "-fps_mode", "vfr",

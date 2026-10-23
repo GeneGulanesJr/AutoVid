@@ -107,13 +107,33 @@ def _wait_ready(url: str, timeout_s: float = 20.0) -> None:
     logger.warning("server did not answer within %.0fs", timeout_s)
 
 
+def _short_path(path: Path) -> str:
+    """Windows 8.3 short path — ASCII-safe for cmd.exe (OEM codepage).
+
+    Falls back to the full path when short names are disabled on the volume
+    or on non-Windows platforms (where the launcher is never written).
+    """
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024) and buf.value:
+            return buf.value
+    except Exception:  # noqa: BLE001 — best effort only
+        pass
+    return str(path)
+
+
 def write_launcher_script(data_dir: Path) -> Path:
     """A double-clickable Windows launcher for non-technical use."""
     script = data_dir / "AutoVid.bat"
-    # pythonw: no console window behind the app.
-    venv_python = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "pythonw.exe"
+    # pythonw: no console window behind the app. Pin the working directory to
+    # the repo so relative lookups can't depend on how the .bat was started.
+    repo_root = Path(__file__).resolve().parent.parent
+    venv_python = _short_path(repo_root / ".venv" / "Scripts" / "pythonw.exe")
     script.write_text(
         "@echo off\r\n"
+        f"cd /d \"{_short_path(repo_root)}\"\r\n"
         f"start \"\" \"{venv_python}\" -m autovid.app_main\r\n",
         encoding="utf-8",
     )

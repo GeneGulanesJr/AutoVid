@@ -28,7 +28,6 @@ from __future__ import annotations
 import bisect
 import json
 import logging
-import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,9 +44,6 @@ from .media import b64_jpeg
 logger = logging.getLogger(__name__)
 
 SHIFT_STEP_S = 0.25
-# Windows/ scenes below this VLM highlight score never become candidate clips.
-# Tunable via AUTOVID_HIGHLIGHT_THRESHOLD (lower it for sparse/abstract footage).
-HIGHLIGHT_THRESHOLD = float(os.environ.get("AUTOVID_HIGHLIGHT_THRESHOLD", "0.4"))
 BOUNDARY_CONTEXT_S = 0.3   # frame offset on each side of a candidate cut
 REFINE_WINDOW_S = 1.5      # a detector cut within this of a shared window edge is "near"
 
@@ -91,7 +87,7 @@ def _boundary_frames(
         for t in dict.fromkeys(times):
             path = nearby_frame(t) if nearby_frame is not None else None
             if path is None:
-                path = frame_at(source, t, frame_dir / f"{tag}_{ts:.3f}_{t:.3f}.jpg", width=512)
+                path = frame_at(source, t, frame_dir / f"{tag}_{ts:.3f}_{t:.3f}.jpg", width=512)[1]
             out.append(b64_jpeg(path))
     return before, after
 
@@ -342,7 +338,9 @@ def catalog_scenes(
             ids.append(cur.lastrowid)
             flagged += 1
             continue
-        if scene["highlight"] < HIGHLIGHT_THRESHOLD:
+        # Windows/scenes below this VLM highlight score never become candidate
+        # clips (Settings.highlight_threshold; lower it for sparse/abstract footage).
+        if scene["highlight"] < settings.highlight_threshold:
             continue
 
         summary = json.dumps({

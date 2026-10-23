@@ -17,8 +17,14 @@ from .config import Settings
 from .edl import EDL
 from .errors import AutoVidError
 from .ffmpeg_io.bins import ffmpeg_path
+from .organize import slugify
 
 logger = logging.getLogger(__name__)
+
+
+def _concat_line(path: Path) -> str:
+    """One concat-demuxer ``file`` directive, safe for ``'`` in the path."""
+    return "file '{}'".format(path.as_posix().replace("'", "'\\''"))
 
 
 def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
@@ -33,7 +39,7 @@ def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
     if fade_out:
         vf.append(f"fade=t=out:st={max(duration - fade_len, 0):.3f}:d={fade_len:.3f}")
     cmd = [
-        ffmpeg_path(), "-y", "-v", "error", "-i", str(src),
+        ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-i", str(src),
         "-vf", ",".join(vf),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy", str(dst),  # fade is video-only; clips are already AAC
@@ -132,7 +138,10 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
     staged: list[Path] = []
     concat_file = out_dir / "concat.txt"
     concat_out = out_dir / "_video_only.mp4"
-    out_path = out_dir / f"{board.name}.mp4"
+    # The name is client- and LLM-settable free text — slugify it so it can
+    # never escape out_dir or carry Windows-illegal characters. The EDL keeps
+    # its display name; only the file on disk is sanitized.
+    out_path = out_dir / f"{slugify(board.name)}.mp4"
     try:
         for i, (item, path) in enumerate(pairs):
             fade_in = item.transition_in == "fade"
@@ -146,7 +155,7 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
                 staged.append(path)
 
         concat_file.write_text(
-            "\n".join(f"file '{p.as_posix()}'" for p in staged), encoding="utf-8"
+            "\n".join(_concat_line(p) for p in staged), encoding="utf-8"
         )
         if board.music_path:
             # Single pass: the concat demuxer feeds the muxer directly, so the
@@ -154,7 +163,7 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
             _render_with_music(concat_file, Path(board.music_path), staged, out_path)
         else:
             cmd = [
-                ffmpeg_path(), "-y", "-v", "error",
+                ffmpeg_path(), "-nostdin", "-y", "-v", "error",
                 "-f", "concat", "-safe", "0", "-i", str(concat_file),
                 "-c", "copy", "-movflags", "+faststart", str(concat_out),
             ]
@@ -196,7 +205,7 @@ def _render_with_music(
     duration = sum(max(probe(p).duration_s, 0.0) for p in staged)
     fade_st = max(duration - 2.0, 0.0)
     cmd = [
-        ffmpeg_path(), "-y", "-v", "error",
+        ffmpeg_path(), "-nostdin", "-y", "-v", "error",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-i", str(music),
         "-map", "0:v:0", "-map", "1:a:0",
