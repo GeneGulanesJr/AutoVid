@@ -112,10 +112,16 @@ def select_clips(
     target_duration_s: float,
     style: str = DEFAULT_STYLE,
     name: str = "rough-cut",
+    persist: bool = True,
 ) -> EDL:
-    """Build (and persist) an EDL from the accepted-segment catalog."""
+    """Build an EDL from the accepted-segment catalog.
+
+    ``persist=False`` builds the selection without storing it — the storyboard
+    document flow wraps the items into scenes and persists those instead.
+    """
     if style == "food":
-        return _select_food(conn, objective=objective, target_duration_s=target_duration_s, name=name)
+        return _select_food(conn, objective=objective, target_duration_s=target_duration_s,
+                            name=name, persist=persist)
     pool = load_candidates(conn)
     if not pool:
         raise ValueError("no accepted segments in the catalog — run the cut stage first")
@@ -166,7 +172,8 @@ def select_clips(
         name=name, objective=objective, style=style,
         target_duration_s=target_duration_s, items=items,
     )
-    edl_mod.save(conn, board)
+    if persist:
+        edl_mod.save(conn, board)
     return board
 
 
@@ -185,7 +192,7 @@ def _canonical_dishes(names: set[str]) -> dict[str, str]:
 
 
 def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s: float,
-                 name: str) -> EDL:
+                 name: str, persist: bool = True) -> EDL:
     """Food-vlog edit: one shot per distinct dish, in the order it was eaten.
 
     shortcut: variants fold into the shortest dish name they end with ("shrimp siomai" ->
@@ -256,5 +263,6 @@ def _select_food(conn: sqlite3.Connection, *, objective: str, target_duration_s:
              for sh, w in shots]
     board = EDL(name=name, objective=objective, style="food",
                 target_duration_s=target_duration_s, items=items)
-    edl_mod.save(conn, board)
+    if persist:
+        edl_mod.save(conn, board)
     return board
