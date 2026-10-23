@@ -20,3 +20,6 @@ dist/
 # local test footage/artifacts
 .e2e/
 probe_tmp/
+
+# regenerable benchmark fixture media (truth.json is committed)
+bench/fixture/*.mp4
