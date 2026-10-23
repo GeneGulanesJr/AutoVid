@@ -93,6 +93,25 @@ def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
     return dst
 
 
+def _conform(src: Path, dst: Path, ref, has_audio: bool) -> Path:
+    """Re-encode ``src`` to ``ref``'s frame size (letterboxed) and frame rate, with an audio track."""
+    w, h = ref.width, ref.height
+    cmd = [ffmpeg_path(), "-y", "-v", "error", "-i", str(src)]
+    if not has_audio:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    cmd += ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                   f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={ref.fps:.6f}",
+            "-map", "0:v", "-map", "0:a" if has_audio else "1:a",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2"]
+    if not has_audio:
+        cmd += ["-shortest"]
+    proc = subprocess.run(cmd + [str(dst)], capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not dst.exists():
+        raise AutoVidError(f"conform failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}")
+    return dst
+
+
 def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]:
     """(item, video file) pairs, extracting whatever the items need.
 
@@ -167,6 +186,8 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
     """
     from .edl import validate_edl
 
+    # ffmpeg resolves concat-list entries against the list's folder, so a relative --data-dir breaks.
+    settings = settings.model_copy(update={"data_dir": settings.data_dir.resolve()})
     validation = validate_edl(conn, board)
     if not validation.ok:
         details = "; ".join(e.message for e in validation.errors)
@@ -179,6 +200,8 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
 
 def _render_unlocked(conn, settings: Settings, board: EDL, out_dir: Path) -> Path:
     """The render itself; caller holds the per-EDL lock."""
+    from .ffmpeg_io.probe import probe
+
     pairs = _materialize(conn, settings, board)
     if not pairs:
         raise AutoVidError("EDL has no items")
@@ -202,6 +225,18 @@ def _render_unlocked(conn, settings: Settings, board: EDL, out_dir: Path) -> Pat
                 ))
             else:
                 staged.append(path)
+
+        # Stream-copy concat needs identical streams. Clips from different cameras (size, frame rate,
+        # no audio track) otherwise leave timestamp gaps, so conform them all to the majority format.
+        infos = [probe(p) for p in staged]
+        if len({(i.width, i.height, round(i.fps, 2), i.has_audio) for i in infos}) > 1:
+            # the format most clips (by length) already have, so the majority is not letterboxed
+            weight: dict[tuple, float] = {}
+            for i in infos:
+                weight[(i.width, i.height, round(i.fps, 2))] = weight.get((i.width, i.height, round(i.fps, 2)), 0) + i.duration_s
+            ref = next(i for i in infos if (i.width, i.height, round(i.fps, 2)) == max(weight, key=weight.get))
+            staged = [_conform(p, out_dir / f"conformed_{k:04d}.mp4", ref, i.has_audio)
+                      for k, (p, i) in enumerate(zip(staged, infos))]
 
         concat_file.write_text(
             "\n".join(_concat_line(p) for p in staged), encoding="utf-8"
@@ -230,7 +265,7 @@ def _render_unlocked(conn, settings: Settings, board: EDL, out_dir: Path) -> Pat
         # render are reproducible from the EDL; referenced item clips stay so
         # the next re-render skips their extraction
         for p in staged:
-            if p.name.startswith("faded_"):
+            if p.name.startswith(("faded_", "conformed_")):
                 p.unlink(missing_ok=True)
         keep = {p.resolve() for _, p in pairs}
         for p in out_dir.glob("item_*.mp4"):

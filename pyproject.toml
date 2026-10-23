@@ -26,6 +26,9 @@ dependencies = [
     # untested here — lift the ceiling deliberately after verifying.
     "librosa>=0.10,<1",
     "soundfile>=0.12",
+    # Speech-to-text for the script stage; faster-whisper 1.2 breaks on PyAV >= 17.
+    "faster-whisper>=1.1",
+    "av>=14,<17",
 ]
 
 [project.optional-dependencies]

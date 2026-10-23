@@ -32,6 +32,86 @@ def _root() -> None:
 
 
 @app.command()
+def run(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, help="Folder of raw videos."),
+    objective: str | None = typer.Option(None, help="What the vlog is about. When given, also writes the "
+                                         "story, lints it and renders a preview."),
+    name: str = typer.Option("story", help="Name of the story EDL."),
+    recursive: bool = typer.Option(False, "--recursive/--no-recursive",
+                                   help="Scan subfolders (off by default: they often hold earlier outputs)."),
+    force: bool = typer.Option(False, "--force", help="Redo transcribe and analyze for every asset."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default: catalog/<folder name>)."),
+) -> None:
+    """Folder → catalog → story in one go: ingest, sample, transcribe, analyze, then (with --objective)
+    story, check and render. Resumes where it left off; re-run it after adding footage."""
+    import re
+
+    from . import sampling
+    from .analyze import analyze_asset
+    from .check import check_edl
+    from .decisions import DecisionClient
+    from .render import render_edl
+    from .script import write_script
+    from .transcribe import load_model, transcribe_asset
+    from .vlm import VLMClient, VLMUnavailable
+
+    settings: Settings = get_settings()
+    slug = re.sub(r"[^a-z0-9]+", "-", folder.resolve().name.lower()).strip("-") or "footage"
+    settings = settings.model_copy(update={"data_dir": data_dir or settings.data_dir / slug})
+    conn = db.connect(settings.db_path)
+    console.print(f"catalog: [bold]{settings.data_dir}[/bold]  (use --data-dir {settings.data_dir} with other commands)")
+
+    vlm = VLMClient(settings)
+    if vlm.configured:
+        try:
+            vlm.ping()  # fail now, with the server's reason, not after the slow stages
+        except VLMUnavailable as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print("[yellow]No AUTOVID_VLM_API_KEY set: scene analysis will be left for manual review.[/yellow]")
+
+    def stage(label: str, ids: list[str], fn) -> None:
+        for aid in ids:
+            try:
+                fn(aid)
+            except Exception as e:  # noqa: BLE001 — one bad asset must not stop the rest
+                console.print(f"[red]{label} {aid}: {e}[/red]")
+        console.print(f"{label}: {len(ids)} asset(s)")
+
+    report = ingest_folder(conn, settings, folder, recursive=recursive)
+    console.print(f"ingest: {len(report.added)} added, {len(report.skipped)} unchanged, "
+                  f"{len(report.duplicates)} duplicates, {len(report.failed)} failed")
+    stage("sample", [r["id"] for r in sampling.pending_assets(conn, "ingested")],
+          lambda aid: sampling.sample_asset(conn, settings, aid))
+
+    to_transcribe = [r["id"] for r in conn.execute("SELECT id FROM assets WHERE has_audio = 1 ORDER BY original_name")
+                     if force or not db.job_done(conn, r["id"], "transcribe")]
+    whisper = load_model(settings) if to_transcribe else None
+    stage("transcribe", to_transcribe, lambda aid: transcribe_asset(conn, settings, aid, model=whisper))
+
+    decisions = DecisionClient(settings, conn)
+    statuses = ("sampled", "analyzed", "cut", "organized") if force else ("sampled",)
+    stage("analyze", [r["id"] for st in statuses for r in sampling.pending_assets(conn, st)],
+          lambda aid: analyze_asset(conn, settings, aid, vlm=vlm, decisions=decisions))
+
+    if not objective:
+        console.print("[dim]Add --objective \"…\" to write the story, check it and render a preview.[/dim]")
+        return
+    try:
+        board, title = write_script(conn, vlm, objective=objective, name=name)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]story: {e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]story[/green] \u201c{title}\u201d: EDL {board.id}, {len(board.items)} items, "
+                  f"{board.duration_s:.1f}s")
+    failed = _print_findings(check_edl(conn, board))
+    console.print(f"preview: {render_edl(conn, settings, board)}")
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command()
 def ingest(
     folder: Path = typer.Argument(..., exists=True, file_okay=False, help="Folder of raw videos."),
     recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Scan subfolders."),
@@ -104,20 +184,23 @@ def sample(
 def analyze(
     asset_id: str | None = typer.Argument(None, help="Specific asset id (a_…)."),
     all: bool = typer.Option(False, "--all", help="Analyze every sampled asset."),
+    force: bool = typer.Option(False, "--force", help="Also re-analyze assets already analyzed "
+                               "(replaces their analyses; re-run `cut` afterwards)."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Build the temporal map: D1-guided window sampling + cloud VLM descriptions."""
     from .analyze import analyze_asset
     from .decisions import DecisionClient
     from .sampling import pending_assets
-    from .vlm import VLMClient
+    from .vlm import VLMClient, VLMUnavailable
 
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
 
-    targets = [row["id"] for row in pending_assets(conn, "sampled")] if (
+    statuses = ("sampled", "analyzed", "cut", "organized") if force else ("sampled",)
+    targets = [row["id"] for st in statuses for row in pending_assets(conn, st)] if (
         all or asset_id is None
     ) else [asset_id]
     if not targets:
@@ -130,6 +213,12 @@ def analyze(
             "[yellow]No AUTOVID_VLM_API_KEY set — windows will be marked uncertain "
             "and flagged for review (decision layer still runs).[/yellow]"
         )
+    else:
+        try:
+            vlm.ping()  # a bad key / model / parameter fails here, before any frame work
+        except VLMUnavailable as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
     decisions = DecisionClient(settings, conn)
 
     with console.status("Analyzing…") as status:
@@ -285,6 +374,96 @@ def rename(
         "SELECT new_path FROM renames WHERE id = ?", (rename_id,)
     ).fetchone()
     console.print(f"[green]Renamed (journal #{rename_id}):[/green] {row['new_path']}")
+
+
+def _print_findings(findings) -> bool:
+    """Print check findings; True when any of them is a failure."""
+    colour = {"ok": "green", "info": "cyan", "warn": "yellow", "fail": "red"}
+    for f in findings:
+        console.print(f"  [{colour[f.level]}]{f.level.upper():4}[/{colour[f.level]}] {f.name}: {f.detail}")
+    return any(f.level == "fail" for f in findings)
+
+
+@app.command()
+def check(
+    edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Lint an EDL: replayed footage, look-alike food shots, tiny clips, food share, mixed formats."""
+    from .check import check_edl
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    row = conn.execute(
+        "SELECT id, name FROM edls WHERE ? IS NULL OR id = ? OR name = ? ORDER BY updated_at DESC LIMIT 1",
+        (edl, edl, edl)).fetchone()
+    if row is None:
+        console.print(f"[red]No EDL {edl!r}.[/red]" if edl else "[red]No EDLs yet.[/red]")
+        raise typer.Exit(1)
+    console.print(f"[bold]{row['name']}[/bold] ({row['id']})")
+    if _print_findings(check_edl(conn, edl_mod.load(conn, row["id"]))):
+        raise typer.Exit(1)
+
+
+@app.command()
+def transcribe(
+    asset_id: str | None = typer.Argument(None, help="Specific asset id (a_…)."),
+    all: bool = typer.Option(False, "--all", help="Transcribe every asset with audio."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Speech-to-text (local faster-whisper) → timestamped utterances for the script stage."""
+    from .transcribe import load_model, transcribe_asset
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    targets = [r["id"] for r in conn.execute("SELECT id FROM assets WHERE has_audio = 1 "
+                                             "ORDER BY original_name")] if (all or asset_id is None) \
+        else [asset_id]
+    if not targets:
+        console.print("[yellow]Nothing to transcribe (no assets with audio).[/yellow]")
+        raise typer.Exit()
+    model = load_model(settings)  # once: loading dominates short clips
+    for i, aid in enumerate(targets, 1):
+        try:
+            n = transcribe_asset(conn, settings, aid, model=model)
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]{aid}: {e}[/red]")
+            continue
+        console.print(f"[green]{aid}[/green] ({i}/{len(targets)}): {n} utterances")
+
+
+@app.command()
+def script(
+    objective: str = typer.Argument(..., help="What the vlog is about, e.g. 'mall day + pancake breakfast'."),
+    name: str = typer.Option("script-cut", help="EDL name."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """LLM orders the spoken lines and food shots into a story (continuity only; needs `transcribe`)."""
+    from .script import write_script
+    from .vlm import VLMClient
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    try:
+        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]EDL {board.id}[/green] “{title}”: {len(board.items)} items, "
+                  f"{board.duration_s:.1f}s of footage")
+    for i, item in enumerate(board.items, 1):
+        console.print(f"  {i:2d}. {item.asset_id[2:8]} {item.source_start:6.1f}–{item.source_end:6.1f}s  "
+                      f"{item.note[:100]}")
+    from .check import check_edl
+
+    console.print("[bold]check[/bold]")
+    _print_findings(check_edl(conn, board))
 
 
 @app.command()

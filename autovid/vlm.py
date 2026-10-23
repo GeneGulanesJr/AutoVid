@@ -93,6 +93,43 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("unbalanced JSON in answer")
 
 
+def _detail(e: Exception) -> str:
+    """The error plus the server's own explanation (a bare "400 Bad Request" hid `temperature` once)."""
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"{e} — {e.response.text.strip()[:300]}"
+    return str(e)
+
+
+def _permanent(e: Exception) -> bool:
+    """A client error (bad key, bad parameter, unknown model) cannot succeed on retry; 429 can."""
+    return (isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500
+            and e.response.status_code not in (408, 429))
+
+
+def list_models(
+    base_url: str, api_key: str, transport: httpx.BaseTransport | None = None
+) -> list[str]:
+    """Model ids from an OpenAI-style ``GET {base_url}/models``.
+
+    Sends both auth styles so the same call works for Anthropic (x-api-key +
+    anthropic-version) and OpenAI-compatible providers (Bearer).
+    """
+    if not api_key:
+        raise VLMUnavailable("no API key configured")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    try:
+        with httpx.Client(timeout=15.0, transport=transport) as client:
+            resp = client.get(base_url.rstrip("/") + "/models", headers=headers)
+        resp.raise_for_status()
+        return sorted(m["id"] for m in resp.json()["data"])
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+        raise VLMUnavailable(f"could not list models from {base_url}: {e}") from e
+
+
 class VLMClient:
     """Thin sync client; one HTTP call per window."""
 
@@ -124,29 +161,15 @@ class VLMClient:
     def configured(self) -> bool:
         return bool(self.settings.vlm_api_key)
 
-    def complete_text(self, *, system: str, user: str, model: str | None = None,
-                      temperature: float = 0.3) -> str:
-        """Text-only completion (no images) — the Storyboard Agent's channel.
+    def _chat(self, body: dict[str, Any], what: str) -> str:
+        """POST one chat completion and return the answer text.
 
-        Same endpoint, key, retry/backoff and usage accounting as
-        :meth:`describe_window`; the answer is raw text (the caller parses
-        and validates the JSON).
+        Transient errors (429 / 5xx / network) are retried with backoff; client errors (bad key,
+        parameter or model) are not, since they cannot succeed. Token usage is counted.
         """
-        if not self.configured:
-            raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
-        body: dict[str, Any] = {
-            "model": model or self.settings.vlm_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "max_tokens": self.settings.vlm_max_tokens,
-        }
         headers = {"Authorization": f"Bearer {self.settings.vlm_api_key}"}
         url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
-
-        last_error: Exception | None = None
+        last_error: str | None = None
         for attempt in range(self.settings.vlm_max_retries + 1):
             try:
                 resp = self._http().post(url, json=body, headers=headers)
@@ -159,11 +182,67 @@ class VLMClient:
                 })
                 return payload["choices"][0]["message"]["content"]
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
-                last_error = e
-                logger.warning("text completion attempt %d failed: %s", attempt + 1, e)
+                last_error = _detail(e)
+                logger.warning("%s attempt %d failed: %s", what, attempt + 1, last_error)
+                if _permanent(e):
+                    break
                 if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:
                     time.sleep(min(2.0 * (2**attempt), 8.0))
-        raise VLMUnavailable(f"text completion failed after retries: {last_error}")
+        raise VLMUnavailable(f"{what} failed after retries: {last_error}")
+
+    def ping(self) -> None:
+        """One tiny call proving the key, base URL and model work; raises VLMUnavailable with the reason."""
+        if not self.configured:
+            raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        body = {"model": self.settings.vlm_model, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply with OK."}]}
+        url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
+        try:
+            self._http().post(url, json=body, headers={"Authorization": f"Bearer {self.settings.vlm_api_key}"},
+                              timeout=min(self.settings.vlm_timeout_s, 30.0)).raise_for_status()
+        except httpx.HTTPError as e:
+            raise VLMUnavailable(f"VLM check failed ({self.settings.vlm_model} @ {self.settings.vlm_base_url}): "
+                                 f"{_detail(e)}") from e
+
+    def complete_text(self, *, system: str, user: str, model: str | None = None,
+                      temperature: float | None = None) -> str:
+        """Text-only completion (no images) — the Storyboard Agent's channel.
+
+        Same endpoint, key, retry/backoff and usage accounting as
+        :meth:`describe_window`; the answer is raw text (the caller parses
+        and validates the JSON). ``temperature`` is only sent when given: newer
+        models (Claude Haiku 5.5) reject the parameter outright.
+        """
+        if not self.configured:
+            raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        body: dict[str, Any] = {
+            "model": model or self.settings.vlm_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "max_tokens": self.settings.vlm_max_tokens,
+        }
+        if temperature is not None:
+            body["temperature"] = temperature
+        return self._chat(body, "text completion")
+
+    def ask_json(self, system: str, user: str | list[dict[str, Any]]) -> dict[str, Any]:
+        """Chat call that must answer with one JSON object (one re-ask for a malformed answer).
+
+        ``user`` is text, or a list of content parts (text and image_url) for image questions.
+        """
+        if not self.configured:
+            raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        body: dict[str, Any] = {
+            "model": self.settings.vlm_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "max_tokens": self.settings.vlm_max_tokens,
+        }
+        last_error = ""
+        for _ in range(2):
+            try:
+                return _extract_json(self._chat(body, "LLM call"))
+            except ValueError as e:
+                last_error = str(e)
+        raise VLMUnavailable(f"LLM answer was not JSON: {last_error}")
 
     def describe_window(
         self,
@@ -197,13 +276,12 @@ class VLMClient:
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": parts},
             ],
-            "temperature": 0.2,
             "max_tokens": self.settings.vlm_max_tokens,
         }
         headers = {"Authorization": f"Bearer {self.settings.vlm_api_key}"}
         url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
 
-        last_error: Exception | None = None
+        last_error: str | None = None
         for attempt in range(self.settings.vlm_max_retries + 1):
             try:
                 resp = self._http().post(url, json=body, headers=headers)
@@ -218,12 +296,14 @@ class VLMClient:
                 analysis = WindowAnalysis.model_validate(_extract_json(text))
                 if analysis.uncertainty >= 0.99 and attempt < self.settings.vlm_max_retries:
                     # An answer that admits total uncertainty is worth one re-ask.
-                    last_error = VLMUnavailable("model returned maximal uncertainty")
+                    last_error = "model returned maximal uncertainty"
                     continue
                 return analysis
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, ValidationError) as e:
-                last_error = e
-                logger.warning("VLM call attempt %d failed: %s", attempt + 1, e)
+                last_error = _detail(e)
+                logger.warning("VLM call attempt %d failed: %s", attempt + 1, last_error)
+                if _permanent(e):
+                    break
                 if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:
                     # 429/5xx/network: back off so retries don't hammer the
                     # endpoint (parse errors retry at once — a delay can't fix them).

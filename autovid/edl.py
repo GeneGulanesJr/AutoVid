@@ -227,16 +227,18 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
                       item_index=idx, clip_id=item.clip_id)
 
     if len(sizes) > 1:
-        issue("error", "mixed_resolution",
+        issue("warning", "mixed_resolution",
               "items span multiple resolutions "
-              f"({', '.join(f'{w}x{h}' for w, h in sorted(sizes))}) — concat would corrupt the output")
+              f"({', '.join(f'{w}x{h}' for w, h in sorted(sizes))}) — the renderer conforms them to the "
+              "majority size (letterboxed re-encode, so rendering is slower)")
     if len(audio_flags) > 1:
-        issue("error", "mixed_audio",
-              "items mix audio and silent sources — the concat stream-copy would "
-              "drop or misalign the audio track")
+        issue("warning", "mixed_audio",
+              "items mix audio and silent sources — the renderer adds silence to the silent ones "
+              "so the audio track stays aligned")
     if rates and max(rates) - min(rates) > max(rates) * 0.01:
         issue("warning", "mixed_fps",
-              f"items span frame rates {min(rates):.2f}–{max(rates):.2f} fps — playback may stutter")
+              f"items span frame rates {min(rates):.2f}–{max(rates):.2f} fps — the renderer converts "
+              "them to one rate when it conforms the clips")
 
     if board.target_duration_s > 0:
         dur = board.duration_s

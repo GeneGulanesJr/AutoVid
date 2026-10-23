@@ -26,6 +26,17 @@ SETTING_GROUPS: list[dict] = [
         ],
     },
     {
+        "group": "Speech-to-text (transcribe + story)",
+        "fields": [
+            {"key": "AUTOVID_WHISPER_BACKEND", "label": "Backend", "secret": False,
+             "help": "auto | whispercpp (AMD/Intel/NVIDIA GPU via Vulkan) | faster-whisper (CPU / NVIDIA)."},
+            {"key": "AUTOVID_WHISPER_MODEL", "label": "Model", "secret": False,
+             "help": "large-v3 is the most accurate for Tagalog/Taglish; large-v3-turbo is faster."},
+            {"key": "AUTOVID_WHISPERCPP_DIR", "label": "whisper.cpp folder", "secret": False,
+             "help": "Holds bin/whisper-cli.exe and models/ggml-<model>.bin (see README)."},
+        ],
+    },
+    {
         "group": "Decision layer (local d1-omni)",
         "fields": [
             {"key": "AUTOVID_DECISIONMCP_URL", "label": "DecisionMCP URL", "secret": False,
@@ -40,6 +51,8 @@ SETTING_GROUPS: list[dict] = [
         "fields": [
             {"key": "AUTOVID_COARSE_WINDOW_S", "label": "Coarse window (s)", "secret": False,
              "help": "Analysis window length — a 1-hour file becomes 60 of these."},
+            {"key": "AUTOVID_FINE_WINDOW_S", "label": "Fine window (s)", "secret": False,
+             "help": "Clips up to 10 min are analyzed in windows this long (places a dish or reaction to ~this)."},
             {"key": "AUTOVID_GRID_INTERVAL_S", "label": "Grid interval (s)", "secret": False},
             {"key": "AUTOVID_HIGHLIGHT_THRESHOLD", "label": "Highlight threshold", "secret": False,
              "help": "Windows below this VLM score never become clips (0–1)."},

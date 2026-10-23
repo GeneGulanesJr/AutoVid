@@ -77,7 +77,7 @@ def test_timeline_overlap_errors_gap_warns(conn) -> None:
     assert any(w.code == "gap" for w in v.warnings)
 
 
-def test_mixed_resolution_errors_mixed_fps_warns(conn, tmp_path) -> None:
+def test_mixed_resolution_and_fps_warn_because_the_renderer_conforms(conn, tmp_path) -> None:
     src = tmp_path / "src2.mp4"
     src.write_bytes(b"\x00")
     seed_asset(conn, "a1", duration=30.0, width=160, height=120, fps=12.0)
@@ -85,7 +85,8 @@ def test_mixed_resolution_errors_mixed_fps_warns(conn, tmp_path) -> None:
     seed_segment(conn, "a1", 1)
     seed_segment(conn, "a2", 2)
     v = validate_edl(conn, EDL(items=[_item(1, asset_id="a1"), _item(2, asset_id="a2")]))
-    assert any(e.code == "mixed_resolution" for e in v.errors)
+    assert v.ok, "mixed resolutions render fine: clips are conformed to the majority size"
+    assert any(w.code == "mixed_resolution" for w in v.warnings)
 
     conn.execute("UPDATE assets SET width=160, height=120, fps=30 WHERE id='a2'")
     conn.commit()
@@ -94,8 +95,8 @@ def test_mixed_resolution_errors_mixed_fps_warns(conn, tmp_path) -> None:
     assert any(w.code == "mixed_fps" for w in v.warnings)
 
 
-def test_mixed_audio_blocks(conn, tmp_path) -> None:
-    """Audio and silent sources cannot stream-copy concat — invalid EDL."""
+def test_mixed_audio_warns(conn, tmp_path) -> None:
+    """Audio and silent sources are joined by adding silence at render time — a warning, not an error."""
     silent_src = tmp_path / "silent.mp4"
     silent_src.write_bytes(b"\x00")
     seed_asset(conn, "a_silent", duration=30.0, path=str(silent_src))
@@ -103,11 +104,12 @@ def test_mixed_audio_blocks(conn, tmp_path) -> None:
     seed_segment(conn, "a1", 1)
     seed_segment(conn, "a_silent", 2)
     v = validate_edl(conn, EDL(items=[_item(1), _item(2, asset_id="a_silent")]))
-    assert any(e.code == "mixed_audio" for e in v.errors)
+    assert v.ok and any(w.code == "mixed_audio" for w in v.warnings)
 
     conn.execute("UPDATE assets SET has_audio = 1 WHERE id = 'a_silent'")
     v = validate_edl(conn, EDL(items=[_item(1), _item(2, asset_id="a_silent")]))
     assert v.ok, [e.message for e in v.errors]
+    assert not any(w.code == "mixed_audio" for w in v.warnings)
 
 
 def test_target_overshoot_warns(conn) -> None:

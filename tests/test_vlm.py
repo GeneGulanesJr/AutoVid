@@ -110,3 +110,58 @@ def test_describe_window_requires_api_key(settings: Settings) -> None:
     client = VLMClient(settings)  # no key
     with pytest.raises(VLMUnavailable, match="API_KEY"):
         client.describe_window(frames=_frames())
+
+
+def test_list_models_sends_both_auth_styles_and_sorts():
+    seen = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["bearer"] = request.headers["authorization"]
+        seen["x_api_key"] = request.headers["x-api-key"]
+        return httpx.Response(200, json={"data": [{"id": "b-model"}, {"id": "a-model"}]})
+
+    from autovid.vlm import list_models
+
+    ids = list_models("https://vlm.test/v1/", "k", _transport(responder))
+    assert ids == ["a-model", "b-model"]
+    assert seen == {"url": "https://vlm.test/v1/models", "bearer": "Bearer k", "x_api_key": "k"}
+
+
+def test_list_models_errors_become_vlm_unavailable():
+    from autovid.vlm import list_models
+
+    with pytest.raises(VLMUnavailable):
+        list_models("https://vlm.test/v1", "k", _transport(lambda r: httpx.Response(401)))
+    with pytest.raises(VLMUnavailable):
+        list_models("https://vlm.test/v1", "")
+
+
+def test_ping_ok_and_failure_carries_the_servers_reason(settings):
+    ok = _client(settings, _transport(lambda r: httpx.Response(200, json=_completion("OK"))))
+    ok.ping()  # no exception
+
+    bad = _client(settings, _transport(lambda r: httpx.Response(
+        400, json={"error": {"message": "`temperature` is deprecated for this model."}})))
+    with pytest.raises(VLMUnavailable, match="temperature.*deprecated"):
+        bad.ping()
+
+
+def test_client_errors_are_not_retried_but_server_errors_are(settings):
+    calls = []
+
+    def responder(status):
+        def _r(request):
+            calls.append(status)
+            return httpx.Response(status, json={"error": {"message": "nope"}})
+        return _r
+
+    client = _client(settings, _transport(responder(400)))  # vlm_max_retries = 1 in the fixture helper
+    with pytest.raises(VLMUnavailable, match="nope"):
+        client.describe_window(frames=[(0.0, "AAAA")])
+    assert calls == [400]                                         # one attempt: a 400 cannot succeed later
+
+    calls.clear()
+    with pytest.raises(VLMUnavailable):
+        _client(settings, _transport(responder(503))).describe_window(frames=[(0.0, "AAAA")])
+    assert calls == [503, 503]                                    # transient: retried

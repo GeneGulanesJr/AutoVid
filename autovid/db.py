@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5  # 5: transcripts table (CREATE IF NOT EXISTS, so older catalogs upgrade in place)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -175,6 +175,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_asset_stage ON jobs(asset_id, stage);
+
+-- Speech-to-text utterances (faster-whisper), source-timeline seconds.
+CREATE TABLE IF NOT EXISTS transcripts (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL REFERENCES assets(id),
+    start_s  REAL NOT NULL,
+    end_s    REAL NOT NULL,
+    text     TEXT NOT NULL,
+    language TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_transcripts_asset ON transcripts(asset_id, start_s);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,

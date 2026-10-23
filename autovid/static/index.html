@@ -91,13 +91,25 @@
       <h4>2 · Run the pipeline stages</h4>
       <div class="toolbar">
         <button class="act" onclick="startStage('sample')">2 · Sample</button>
-        <button class="act" onclick="startStage('analyze')">3 · Analyze (VLM + d1)</button>
-        <button class="act" onclick="startStage('cut')">4 · Cut</button>
-        <button class="act" onclick="startStage('organize')">5 · Organize</button>
+        <button class="act" onclick="startStage('transcribe')">3 · Transcribe (speech)</button>
+        <button class="act" onclick="startStage('analyze')">4 · Analyze (VLM + d1)</button>
+        <button class="act" onclick="startStage('cut')">5 · Cut</button>
+        <button class="act" onclick="startStage('organize')">6 · Organize</button>
       </div>
       <p class="dim">Each stage processes every asset that is ready for it. Analyze uses
       the cloud VLM (needs a key in Setup) and the local decision layer;
       without them it marks windows for manual review instead.</p>
+    </div>
+    <div class="card">
+      <h4>7 · Story (speech + food, in order)</h4>
+      <div class="toolbar">
+        <input id="scObjective" placeholder="what the vlog is about, e.g. a day at the mall, then breakfast" size="52">
+        <input id="scName" placeholder="name" value="script-cut" size="12">
+        <button class="act primary" onclick="writeScript()">Write story</button>
+      </div>
+      <p class="dim">Needs Transcribe and Analyze first. Picks the spoken lines and one best shot per dish,
+      then checks the result for replayed footage, look-alike shots and food share. Edit and render it in the EDL tab.</p>
+      <div id="scOut" class="dim"></div>
     </div>
     <div id="jobsPanel"></div>
   </section>
@@ -213,7 +225,44 @@ async function loadSetup() {
   $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${esc(g.group)}</h4>` +
     g.fields.map(f => `<div class="field"><label>${esc(f.label)}</label>
       <input id="set_${f.key}" value="${esc(f.value)}" data-orig="${esc(f.value)}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
+      ${EXTRA[f.key] || ""}
       <span class="hint">${esc(f.help || "")} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
+}
+const BASE_URLS = {
+  "Anthropic": "https://api.anthropic.com/v1",
+  "OpenAI": "https://api.openai.com/v1",
+  "OpenRouter": "https://openrouter.ai/api/v1",
+  "Z.ai": "https://api.z.ai/api/paas/v4",
+};
+const pick = (id, v) => { if (v) $("#" + id).value = v; };
+const EXTRA = {
+  AUTOVID_VLM_BASE_URL: `<select onchange="pick('set_AUTOVID_VLM_BASE_URL', this.value)">
+    <option value="">presets…</option>${Object.entries(BASE_URLS).map(([n, u]) => `<option value="${u}">${n} — ${u}</option>`).join("")}</select>`,
+  AUTOVID_VLM_MODEL: `<button class="act" onclick="loadModels()">List models</button>
+    <select id="modelList" onchange="pick('set_AUTOVID_VLM_MODEL', this.value)"><option value="">models…</option></select>
+    <button class="act" onclick="testVlm()">Test connection</button>`,
+};
+async function testVlm() {
+  const key = $("#set_AUTOVID_VLM_API_KEY").value;
+  $("#settingsMsg").textContent = "testing…";
+  try {
+    const r = await api("/api/vlm/test", {method: "POST", body: {
+      base_url: $("#set_AUTOVID_VLM_BASE_URL").value, model: $("#set_AUTOVID_VLM_MODEL").value,
+      api_key: key.includes("…") ? "" : key}});
+    $("#settingsMsg").textContent = `OK — ${r.model} answered`;
+  } catch (e) { $("#settingsMsg").textContent = "test failed: " + e.message; }
+}
+async function loadModels() {
+  const key = $("#set_AUTOVID_VLM_API_KEY").value;
+  try {
+    const r = await api("/api/models", {method: "POST", body: {
+      base_url: $("#set_AUTOVID_VLM_BASE_URL").value,
+      api_key: key.includes("…") ? "" : key,   // masked = use the saved key
+    }});
+    $("#modelList").innerHTML = '<option value="">models…</option>' +
+      r.models.map(m => `<option>${m}</option>`).join("");
+    $("#settingsMsg").textContent = r.models.length + " models";
+  } catch (e) { $("#settingsMsg").textContent = "model list failed: " + e.message; }
 }
 async function saveSettings() {
   const values = {};
@@ -234,6 +283,16 @@ async function startIngest() {
   if (!folder) return;
   const j = await api("/api/pipeline/ingest", {method:"POST", body:{folder, recursive: $("#recursive").checked}});
   watch(j.id);
+}
+async function writeScript() {
+  const objective = $("#scObjective").value.trim();
+  if (!objective) return;
+  $("#scOut").textContent = "writing the story…";
+  try {
+    const r = await api("/api/script", {method: "POST", body: {objective, name: $("#scName").value.trim() || "script-cut"}});
+    $("#scOut").innerHTML = `<b>${esc(r.title)}</b> — EDL ${esc(r.edl_id)}, ${r.items} items, ${r.duration_s.toFixed(1)}s<br>` +
+      r.findings.map(f => `${pill(f.level, f.level === "fail" ? "bad" : f.level === "warn" ? "warn" : "ok")} ${esc(f.name)}: ${esc(f.detail)}`).join("<br>");
+  } catch (e) { $("#scOut").textContent = e.message; }
 }
 async function startStage(stage) {
   try { const j = await api(`/api/pipeline/${stage}`, {method:"POST", body:{}}); watch(j.id); }
