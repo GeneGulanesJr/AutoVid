@@ -89,19 +89,3 @@ def list_edls(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "SELECT id, name, objective, style, target_duration_s, updated_at "
         "FROM edls ORDER BY updated_at DESC"
     ).fetchall()
-
-
-def resolve_clip(conn: sqlite3.Connection, edl: EDL, catalog_dir: Path) -> list[tuple[EDLItem, Path]]:
-    """Materialized (item, clip file) pairs; missing clips raise with context."""
-    pairs: list[tuple[EDLItem, Path]] = []
-    for item in edl.items:
-        row = conn.execute(
-            "SELECT clip_path FROM segments WHERE id = ?", (item.clip_id,)
-        ).fetchone()
-        if row is None or not row["clip_path"]:
-            raise AutoVidError(f"EDL item for segment {item.clip_id} has no extracted clip")
-        path = Path(row["clip_path"])
-        if not path.exists():
-            raise AutoVidError(f"Clip file missing: {path}")
-        pairs.append((item, path))
-    return pairs

@@ -1,8 +1,12 @@
-"""AutoVid command-line interface."""
+"""AutoVid command-line interface.
+
+Heavy modules (numpy/PIL/librosa chains) are imported inside the command
+bodies, not at module level: ``autovid status`` / ``edls`` / ``--help`` must
+not pay for them on every invocation.
+"""
 from __future__ import annotations
 
 import json
-import sys
 import sys
 from pathlib import Path
 
@@ -10,19 +14,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import db, edl as edl_mod, sampling
-from .analyze import analyze_asset
-from .bench import run_benchmark
+from . import db, edl as edl_mod
 from .config import Settings, get_settings
-from .decisions import DecisionClient
 from .ingest import ingest_folder
-from .music import analyze_music
-from .organize import apply_rename, organize_asset, search as search_segments, undo_rename
-from .planner import plan_music_video
-from .refine import cut_asset
-from .render import render_edl
-from .storyboard import select_clips
-from .vlm import VLMClient
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -76,12 +70,14 @@ def sample(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Baseline sampling: scene boundaries + grid frames + motion metrics."""
+    from .sampling import pending_assets, sample_asset
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
 
-    targets = [row["id"] for row in sampling.pending_assets(conn)] if (
+    targets = [row["id"] for row in pending_assets(conn)] if (
         all or asset_id is None
     ) else [asset_id]
     if asset_id is not None and all:
@@ -94,7 +90,7 @@ def sample(
         for i, aid in enumerate(targets, 1):
             status.update(f"[{i}/{len(targets)}] {aid}")
             try:
-                result = sampling.sample_asset(conn, settings, aid)
+                result = sample_asset(conn, settings, aid)
             except Exception as e:  # noqa: BLE001
                 console.print(f"[red]{aid}: {e}[/red]")
                 continue
@@ -111,12 +107,17 @@ def analyze(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Build the temporal map: D1-guided window sampling + cloud VLM descriptions."""
+    from .analyze import analyze_asset
+    from .decisions import DecisionClient
+    from .sampling import pending_assets
+    from .vlm import VLMClient
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
 
-    targets = [row["id"] for row in sampling.pending_assets(conn, "sampled")] if (
+    targets = [row["id"] for row in pending_assets(conn, "sampled")] if (
         all or asset_id is None
     ) else [asset_id]
     if not targets:
@@ -155,12 +156,16 @@ def cut(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Verify boundaries, accept candidate segments, extract clips."""
+    from .decisions import DecisionClient
+    from .refine import cut_asset
+    from .sampling import pending_assets
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
 
-    targets = [row["id"] for row in sampling.pending_assets(conn, "analyzed")] if (
+    targets = [row["id"] for row in pending_assets(conn, "analyzed")] if (
         all or asset_id is None
     ) else [asset_id]
     if not targets:
@@ -193,12 +198,15 @@ def organize(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Tag segments, flag quality, suggest recoverable filenames."""
+    from .organize import organize_asset
+    from .sampling import pending_assets
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
 
-    targets = [row["id"] for row in sampling.pending_assets(conn, "cut")] if (
+    targets = [row["id"] for row in pending_assets(conn, "cut")] if (
         all or asset_id is None
     ) else [asset_id]
     if not targets:
@@ -222,6 +230,8 @@ def search(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Search the segment catalog."""
+    from .organize import search as search_segments
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -257,6 +267,8 @@ def rename(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Rename an extracted clip to its suggested name (journal-backed, reversible)."""
+    from .organize import apply_rename, undo_rename
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -286,6 +298,8 @@ def storyboard(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Select accepted segments into an ordered, editable EDL."""
+    from .storyboard import select_clips
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -343,6 +357,8 @@ def render(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Render a rough-cut preview MP4 from an EDL."""
+    from .render import render_edl
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -377,6 +393,10 @@ def bench(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
     """Compare fixed-interval baseline vs decision-guided processing."""
+    from .bench import run_benchmark
+    from .decisions import DecisionClient
+    from .vlm import VLMClient
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -388,9 +408,7 @@ def bench(
         conn, settings, vlm=VLMClient(settings), decisions=decisions,
         ground_truth=truth, name=name,
     )
-    from pathlib import Path as _P
-
-    md = _P(settings.data_dir) / "bench" / name / "report.md"
+    md = Path(settings.data_dir) / "bench" / name / "report.md"
     console.print(md.read_text(encoding="utf-8"))
     console.print(f"[dim]Full report: {md.with_suffix('.json')}[/dim]")
 
@@ -433,6 +451,11 @@ def musicvideo(
     selection and cut placement come from the catalog; the decision layer
     reviews each section's draft plan.
     """
+    from .decisions import DecisionClient
+    from .music import analyze_music
+    from .planner import plan_music_video
+    from .render import render_edl
+
     settings: Settings = get_settings()
     if data_dir is not None:
         settings = settings.model_copy(update={"data_dir": data_dir})
@@ -535,14 +558,7 @@ def _utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-def _utf8_stdio() -> None:  # Windows consoles default to cp1252, which can't print our arrows.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-
-
 def main() -> None:
-    _utf8_stdio()
     _utf8_stdio()
     app()
 

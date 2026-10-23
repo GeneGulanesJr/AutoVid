@@ -421,7 +421,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for aid in targets:
                     job.current = aid
                     if stage == "sample":
-                        sampling.sample_asset(c, s, aid)
+                        sample_asset(c, s, aid)
                     elif stage == "analyze":
                         analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
                     elif stage == "cut":
