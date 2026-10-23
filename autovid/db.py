@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -66,8 +66,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     confidence        REAL,
-    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (asset_id, window_start)
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS segments (
@@ -140,14 +139,20 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
--- v1 → v2 migration (idempotent): analyses had no window uniqueness, so
+-- v1 → v3 migration (idempotent): analyses had no window uniqueness, so
 -- re-runs duplicated rows and doubled downstream model work. Keep the
 -- newest row per window, then enforce one row per (asset, window).
+-- The constraint MUST be a named unique index (not an inline table
+-- UNIQUE): CREATE TABLE IF NOT EXISTS is a no-op on pre-existing
+-- catalogs, and the upsert in analyze_asset needs the index to exist
+-- there too.
 DELETE FROM analyses WHERE id NOT IN (
     SELECT MAX(id) FROM analyses GROUP BY asset_id, window_start
 );
 DROP INDEX IF EXISTS idx_frames_asset;    -- duplicate of the UNIQUE autoindex
-DROP INDEX IF EXISTS idx_analyses_asset;  -- superseded by the UNIQUE autoindex
+DROP INDEX IF EXISTS idx_analyses_asset;  -- superseded by the unique index below
+CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_asset_window
+    ON analyses(asset_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
 """
 

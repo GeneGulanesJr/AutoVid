@@ -89,10 +89,18 @@ def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]
             settings.data_dir / "renders" / board.id
             / f"item_{item.clip_id}_{item.source_start:.3f}-{item.source_end:.3f}.mp4"
         )
-        if staged.exists() and abs(probe(staged).duration_s - item_span) < 0.25:
-            pairs.append((item, staged))
-            continue
-        extract_clip(source, staged, start_s=item.source_start, end_s=item.source_end)
+        if staged.exists():
+            try:
+                if abs(probe(staged).duration_s - item_span) < 0.25:
+                    pairs.append((item, staged))
+                    continue
+            except Exception:  # noqa: BLE001 — partial/corrupt staged clip
+                pass  # fall through: re-extract over it (a killed render must
+                # never poison every future render of this EDL)
+        # .part.mp4, not .part: ffmpeg picks its muxer from the extension
+        tmp = staged.with_name(staged.stem + ".part.mp4")
+        extract_clip(source, tmp, start_s=item.source_start, end_s=item.source_end)
+        tmp.replace(staged)
         pairs.append((item, staged))
     return pairs
 
@@ -158,7 +166,7 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
         keep = {p.resolve() for _, p in pairs}
         for p in out_dir.glob("item_*.mp4"):
             if p.resolve() not in keep:
-                p.unlink(missing_ok=True)
+                p.unlink(missing_ok=True)  # includes *.part.mp4 leftovers
         concat_file.unlink(missing_ok=True)
         concat_out.unlink(missing_ok=True)
 

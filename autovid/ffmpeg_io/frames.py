@@ -33,16 +33,20 @@ def _seek_args(start_s: float | None, end_s: float | None) -> tuple[list[str], f
 
     Input seeking resets ffmpeg's timestamps to ~0, so callers rebase parsed
     ``pts_time`` values by the returned offset to stay on the source timeline.
+    A span that starts at 0 still gets ``-t`` — without it the first window
+    would decode the entire file instead of just its span.
     """
-    if start_s is None or start_s <= 0:
-        return [], 0.0
-    args = ["-ss", f"{start_s:.3f}"]
+    start = float(start_s) if start_s is not None else 0.0
+    if end_s is not None and end_s <= start:
+        return [], 0.0  # empty/invalid span
+    if start > 0:
+        args = ["-ss", f"{start:.3f}"]
+        if end_s is not None:
+            args += ["-t", f"{end_s - start:.3f}"]
+        return args, start
     if end_s is not None:
-        span = end_s - start_s
-        if span <= 0:
-            return [], 0.0
-        args += ["-t", f"{span:.3f}"]
-    return args, float(start_s)
+        return ["-t", f"{end_s:.3f}"], 0.0
+    return [], 0.0
 
 
 def extract_periodic_frames(
@@ -64,8 +68,6 @@ def extract_periodic_frames(
     re-decodes the full source once per window.
     """
     seek, offset = _seek_args(start_s, end_s)
-    if start_s is not None and start_s > 0 and not seek:
-        return []  # empty/invalid span
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = out_dir / f"{prefix}_%06d.jpg"
     scale = f",scale={width}:-2" if width else ""

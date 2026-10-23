@@ -73,19 +73,26 @@ def _boundary_frames(
     source: Path,
     ts: float,
     duration_s: float,
+    nearby_frame=None,
 ) -> tuple[list[str], list[str]]:
-    """(before_b64, after_b64) around a candidate cut."""
+    """(before_b64, after_b64) around a candidate cut.
+
+    ``nearby_frame(t) -> path | None`` lets the caller serve a probe from an
+    already-extracted grid/dense frame within ~±0.3 s instead of spawning one
+    ffmpeg process per probe frame on Windows.
+    """
     before_ts = [max(ts - BOUNDARY_CONTEXT_S, 0.0), max(ts - BOUNDARY_CONTEXT_S / 2, 0.0)]
     after_ts = [min(ts + BOUNDARY_CONTEXT_S / 2, duration_s - 0.05),
                 min(ts + BOUNDARY_CONTEXT_S, duration_s - 0.05)]
     frame_dir = settings.assets_dir / asset_id / "probe"
     before, after = [], []
-    for t in dict.fromkeys(before_ts):
-        p = frame_at(source, t, frame_dir / f"b_{ts:.3f}_{t:.3f}.jpg", width=512)
-        before.append(b64_jpeg(p))
-    for t in dict.fromkeys(after_ts):
-        p = frame_at(source, t, frame_dir / f"a_{ts:.3f}_{t:.3f}.jpg", width=512)
-        after.append(b64_jpeg(p))
+    for tag, times in (("b", before_ts), ("a", after_ts)):
+        out = before if tag == "b" else after
+        for t in dict.fromkeys(times):
+            path = nearby_frame(t) if nearby_frame is not None else None
+            if path is None:
+                path = frame_at(source, t, frame_dir / f"{tag}_{ts:.3f}_{t:.3f}.jpg", width=512)
+            out.append(b64_jpeg(path))
     return before, after
 
 
@@ -161,6 +168,16 @@ def segment_scenes(
         i = bisect.bisect_left(frame_ts, t)
         return frame_path[frame_ts[i]] if i < len(frame_ts) else None
 
+    def nearest_frame(t: float, tol: float = BOUNDARY_CONTEXT_S) -> str | None:
+        """Closest extracted frame within ``tol`` of ``t`` (boundary probes)."""
+        i = bisect.bisect_left(frame_ts, t)
+        best: int | None = None
+        for j in (i - 1, i):
+            if 0 <= j < len(frame_ts) and abs(frame_ts[j] - t) <= tol:
+                if best is None or abs(frame_ts[j] - t) < abs(frame_ts[best] - t):
+                    best = j
+        return frame_path[frame_ts[best]] if best is not None else None
+
     cuts = sorted(
         float(r["start_s"])
         for r in conn.execute(
@@ -217,7 +234,8 @@ def segment_scenes(
         stats["verified"] += 1
         if is_near:
             before, after = _boundary_frames(
-                conn, settings, asset_id, source, cut_ts, duration_s
+                conn, settings, asset_id, source, cut_ts, duration_s,
+                nearby_frame=nearest_frame,
             )
             bv = decisions.decide_boundary(
                 asset_id,
