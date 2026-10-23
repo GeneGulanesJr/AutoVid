@@ -115,6 +115,47 @@ class VLMClient:
     def configured(self) -> bool:
         return bool(self.settings.vlm_api_key)
 
+    def complete_text(self, *, system: str, user: str, model: str | None = None,
+                      temperature: float = 0.3) -> str:
+        """Text-only completion (no images) — the Storyboard Agent's channel.
+
+        Same endpoint, key, retry/backoff and usage accounting as
+        :meth:`describe_window`; the answer is raw text (the caller parses
+        and validates the JSON).
+        """
+        if not self.configured:
+            raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        body: dict[str, Any] = {
+            "model": model or self.settings.vlm_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": self.settings.vlm_max_tokens,
+        }
+        headers = {"Authorization": f"Bearer {self.settings.vlm_api_key}"}
+        url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
+
+        last_error: Exception | None = None
+        for attempt in range(self.settings.vlm_max_retries + 1):
+            try:
+                resp = self._http().post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                payload = resp.json()
+                usage = payload.get("usage") or {}
+                self.usage.append({
+                    "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                    "completion_tokens": int(usage.get("completion_tokens") or 0),
+                })
+                return payload["choices"][0]["message"]["content"]
+            except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+                last_error = e
+                logger.warning("text completion attempt %d failed: %s", attempt + 1, e)
+                if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:
+                    time.sleep(min(2.0 * (2**attempt), 8.0))
+        raise VLMUnavailable(f"text completion failed after retries: {last_error}")
+
     def describe_window(
         self,
         *,

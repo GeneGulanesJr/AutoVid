@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # JSON answer, so the budget must cover both or the answer truncates.
     vlm_max_tokens: int = 4096
 
+    # Storyboard Agent (text-only planner over the catalog digest). Empty →
+    # same model as the VLM; point it at a cheaper/fast text model if desired.
+    agent_model: str = ""
+
     # Baseline sampling policy (the decision layer may override per region).
     grid_interval_s: float = 2.0
     thumb_interval_s: float = 30.0

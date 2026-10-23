@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -118,8 +118,50 @@ CREATE TABLE IF NOT EXISTS edls (
     style             TEXT NOT NULL DEFAULT '',
     target_duration_s REAL NOT NULL DEFAULT 0,
     items_json        TEXT NOT NULL DEFAULT '[]',
+    storyboard_id     TEXT,              -- EDL compiled from a storyboard (v4)
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Storyboards (v4): the central planning artifact. Scenes reference catalog
+-- segments; versions are append-only (restore = save as a new version).
+CREATE TABLE IF NOT EXISTS storyboards (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    objective         TEXT NOT NULL DEFAULT '',
+    style             TEXT NOT NULL DEFAULT '',
+    target_duration_s REAL NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'draft',  -- draft | approved
+    current_version   INTEGER NOT NULL DEFAULT 0,
+    music_path        TEXT,
+    mode              TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS storyboard_versions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    storyboard_id TEXT NOT NULL REFERENCES storyboards(id),
+    version       INTEGER NOT NULL,
+    origin        TEXT NOT NULL DEFAULT 'user_edit',
+        -- agent | planner | user_edit | script_edit | restore
+    note          TEXT,
+    document_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (storyboard_id, version)
+);
+
+-- Script (v4): narration / dialogue / on-screen text per story beat —
+-- narrative only, no timeline data. Storyboard scenes reference beats by id.
+CREATE TABLE IF NOT EXISTS scripts (
+    id            TEXT PRIMARY KEY,
+    storyboard_id TEXT NOT NULL UNIQUE REFERENCES storyboards(id),
+    title         TEXT NOT NULL DEFAULT '',
+    synopsis      TEXT NOT NULL DEFAULT '',
+    beats_json    TEXT NOT NULL DEFAULT '[]',
+    origin        TEXT NOT NULL DEFAULT 'planner',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Per-asset stage ledger; resumability = skip (asset, stage) rows marked done.
@@ -178,6 +220,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     if version >= SCHEMA_VERSION:
         return
     conn.executescript(_SCHEMA)
+    if version < 4:
+        # v3 → v4: storyboards/scripts are new tables (CREATE IF NOT EXISTS
+        # covers them), but the edls.storyboard_id column must be added to
+        # catalogs created before v4 — ALTER has no IF NOT EXISTS.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(edls)")}
+        if "storyboard_id" not in cols:
+            conn.execute("ALTER TABLE edls ADD COLUMN storyboard_id TEXT")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 

@@ -111,7 +111,18 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
     With ``board.music_path`` set (music-driven editing), the music is muxed
     over the stitched video: video length always wins, the audio is padded if
     short and faded out over the last 2 s.
+
+    The EDL is validated first (unknown segments, bad ranges, timeline
+    overlaps, mixed resolutions) — rendering an invalid cut wastes minutes of
+    ffmpeg only to produce a broken file.
     """
+    from .edl import validate_edl
+
+    validation = validate_edl(conn, board)
+    if not validation.ok:
+        details = "; ".join(e.message for e in validation.errors)
+        raise AutoVidError(f"EDL failed validation: {details}")
+
     pairs = _materialize(conn, settings, board)
     if not pairs:
         raise AutoVidError("EDL has no items")
