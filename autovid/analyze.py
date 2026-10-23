@@ -218,6 +218,8 @@ def analyze_asset(
                 result.unparsed += 1
                 result.notes.append(f"[{start:.1f}-{end:.1f}s] VLM unavailable: {e}")
 
+            window_prompt_tokens = sum(e["prompt_tokens"] for e in vlm.usage)
+            window_completion_tokens = sum(e["completion_tokens"] for e in vlm.usage)
             for entry in vlm.usage:
                 result.prompt_tokens += entry["prompt_tokens"]
                 result.completion_tokens += entry["completion_tokens"]
@@ -256,7 +258,7 @@ def analyze_asset(
                         "flagged": flagged,
                         "engine": action.engine,
                     }),
-                    0, 0,
+                    window_prompt_tokens, window_completion_tokens,
                     round(1.0 - uncertainty, 3),
                 ),
             )
