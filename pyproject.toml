@@ -11,14 +11,20 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.7",
     "httpx>=0.27",
-    "pillow>=10.4",
+    # 13.x fixes every known advisory against ≤12.x but needs Python ≥3.11;
+    # on 3.10 the floor keeps the best available build. The parser is on-path
+    # (decodes frames extracted from untrusted footage) — upgrade the venv to
+    # 3.11+ to pick up the fixed line.
+    "pillow>=13; python_version >= '3.11'",
+    "pillow>=10.4; python_version < '3.11'",
     "numpy>=1.26",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     # Match DecisionMCP's server SDK generation (its client API differs in 2.x).
     "mcp>=1.9,<2",
-    # Music-driven editing: beat/tempo/energy analysis.
-    "librosa>=0.10",
+    # Music-driven editing: beat/tempo/energy analysis. <1: 1.0 (2026-08) is
+    # untested here — lift the ceiling deliberately after verifying.
+    "librosa>=0.10,<1",
     "soundfile>=0.12",
 ]
 

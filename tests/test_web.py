@@ -63,7 +63,8 @@ def client(settings: Settings, tmp_path: Path, monkeypatch) -> TestClient:
     conn.commit()
     conn.close()
 
-    return TestClient(create_app(settings))
+    # Host header must pass the API's localhost-only guard.
+    return TestClient(create_app(settings), base_url="http://127.0.0.1")
 
 
 def test_index_serves_html(client: TestClient) -> None:

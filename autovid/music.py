@@ -55,7 +55,7 @@ def _decode_mono(path: str | Path) -> tuple[np.ndarray, int]:
         wav_path = Path(tmp.name)
     try:
         cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "error",
             "-i", str(path),
             "-ac", "1", "-ar", str(SR),
             "-f", "wav", str(wav_path),
@@ -155,7 +155,7 @@ def section_audio_b64(
         wav_path = Path(tmp.name)
     try:
         cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "error",
             "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
             "-i", str(path),
             "-ac", "1", "-ar", str(sample_rate),

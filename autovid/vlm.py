@@ -69,10 +69,19 @@ described in the preceding context (true) or starts a new one (false)."""
 
 def _extract_json(text: str) -> dict[str, Any]:
     """First balanced JSON object in the answer, tolerating markdown fences."""
+    if not text:
+        raise ValueError("empty answer")
     text = re.sub(r"```(?:json)?", "", text)
     start = text.find("{")
     if start == -1:
         raise ValueError("no JSON object in answer")
+    # Prefer parsing everything from the first '{' — brace counting alone
+    # truncates objects whose string values contain '}'. The balanced scan
+    # only handles what's left: trailing prose after a valid object.
+    try:
+        return json.loads(text[start:])
+    except json.JSONDecodeError:
+        pass
     depth = 0
     for i in range(start, len(text)):
         if text[i] == "{":
@@ -149,7 +158,7 @@ class VLMClient:
                     "completion_tokens": int(usage.get("completion_tokens") or 0),
                 })
                 return payload["choices"][0]["message"]["content"]
-            except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+            except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
                 last_error = e
                 logger.warning("text completion attempt %d failed: %s", attempt + 1, e)
                 if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:
@@ -212,7 +221,7 @@ class VLMClient:
                     last_error = VLMUnavailable("model returned maximal uncertainty")
                     continue
                 return analysis
-            except (httpx.HTTPError, KeyError, IndexError, ValueError, ValidationError) as e:
+            except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, ValidationError) as e:
                 last_error = e
                 logger.warning("VLM call attempt %d failed: %s", attempt + 1, e)
                 if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:

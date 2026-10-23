@@ -216,6 +216,7 @@ def plan_music_video(
     for plan in section_plans:
         prev_tags: frozenset[str] = frozenset()
         prefer = "duration" if plan["mood"] == "calm" else "score"
+        section_first = len(items)  # this section's items are items[section_first:]
         for slot_start, slot_end in plan["slots"]:
             slot_len = slot_end - slot_start
             clip = _pick_clip(candidates, used, slot_len, prev_tags, prefer=prefer)
@@ -247,7 +248,8 @@ def plan_music_video(
             prev_tags = clip.tags
             timeline += slot_len
 
-        if decisions is not None and items:
+        section_items = items[section_first:]
+        if decisions is not None and section_items:
             review = decisions.decide_sequence_review(
                 context=json.dumps({
                     "role": plan["role"],
@@ -255,17 +257,19 @@ def plan_music_video(
                     "section_start": plan["start"],
                     "section_end": plan["end"],
                     "beats_per_cut": plan["beats_per_cut"],
+                    # Exactly the items this section produced — plan["start"]
+                    # is a music-track position and must not be compared with
+                    # the items' output-timeline positions.
                     "clips": [
                         {"clip_id": i.clip_id, "tags": [], "slot_s":
                          round((i.timeline_end or 0) - (i.timeline_start or 0), 2)}
-                        for i in items if i.timeline_start is not None
-                        and i.timeline_start >= plan["start"] - 0.01
+                        for i in section_items
                     ],
                 }),
             )
-            if review.action == "replace_clip" and len(items) >= 2:
+            if review.action == "replace_clip" and len(section_items) >= 2:
                 # swap the section's middle item for the best unused candidate
-                mid = len(items) - max(1, len(items) // 2)
+                mid = section_first + max(1, len(section_items) // 2)
                 old = items[mid]
                 replacement = _pick_clip(
                     candidates, used | {old.clip_id},

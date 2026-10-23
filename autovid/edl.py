@@ -52,8 +52,11 @@ class EDL(BaseModel):
 
     @property
     def duration_s(self) -> float:
-        if self.items and self.items[-1].timeline_end is not None:
-            return max(i.timeline_end for i in self.items)
+        # Timeline placement wins as soon as any item has it; max over the
+        # items that carry it (never compare None with float).
+        ends = [i.timeline_end for i in self.items if i.timeline_end is not None]
+        if ends:
+            return max(ends)
         return sum(i.source_end - i.source_start for i in self.items)
 
     def touch(self) -> None:
@@ -208,14 +211,14 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
                 issue("error", "bad_timeline",
                       f"item {idx + 1}: timeline end {item.timeline_end:.2f} ≤ start {item.timeline_start:.2f}",
                       item_index=idx, clip_id=item.clip_id)
-            prev = board.items[idx - 1]
-            if idx > 0 and prev.timeline_end is not None \
+            prev = board.items[idx - 1] if idx > 0 else None
+            if prev is not None and prev.timeline_end is not None \
                     and item.timeline_start < prev.timeline_end - 1e-6:
                 issue("error", "overlap",
                       f"item {idx + 1} starts at {item.timeline_start:.2f}s before item {idx} "
                       f"ends at {prev.timeline_end:.2f}s",
                       item_index=idx, clip_id=item.clip_id)
-            if idx > 0 and prev.timeline_end is not None \
+            if prev is not None and prev.timeline_end is not None \
                     and item.timeline_start > prev.timeline_end + GAP_TOLERANCE_S:
                 issue("warning", "gap",
                       f"{item.timeline_start - prev.timeline_end:.2f}s gap between items {idx} and {idx + 1}",

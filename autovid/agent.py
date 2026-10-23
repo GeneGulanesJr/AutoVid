@@ -38,6 +38,12 @@ from .vlm import VLMClient, _extract_json
 logger = logging.getLogger(__name__)
 
 SPAN_TOLERANCE_S = 0.05
+# The agent's answer is untrusted in shape as well as content: a draft with
+# missing keys, nulls or arrays where objects were expected raises
+# KeyError/IndexError/TypeError while parsing. Those must trigger the
+# documented fallbacks — the deterministic planner, or scene-kept-with-issue —
+# never abort the job with a raw exception.
+PARSE_FAILURES = (ValueError, KeyError, IndexError, TypeError)
 
 _SYSTEM_PROMPT = """You are the AutoVid Storyboard Agent: a narrative planner. You receive \
 a catalog digest of REAL footage segments (ids, source spans, descriptions, tags, scores) \
@@ -277,7 +283,7 @@ class StoryboardAgent:
                 raise AutoVidError(f"storyboard has no scene {scene_id!r}")
             try:
                 replacement = self._regen_one_scene(conn, row, document, script, scene)
-            except (AgentUnavailable, ValidationError, ValueError) as e:
+            except (AgentUnavailable, ValidationError, *PARSE_FAILURES) as e:
                 logger.warning("scene regeneration failed, keeping current scene: %s", e)
                 scene.open_issues.append(f"regeneration failed: {str(e)[:120]}")
                 return doc_mod.save_document(
@@ -455,7 +461,7 @@ def generate_with_fallback(
                     style=style, name=name,
                 )
                 return board_id, "agent"
-            except (AgentUnavailable, ValidationError, ValueError) as e:
+            except (AgentUnavailable, ValidationError, *PARSE_FAILURES) as e:
                 logger.warning("agent generation failed (%s) — falling back to planner", e)
     finally:
         client.close()

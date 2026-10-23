@@ -1,9 +1,11 @@
 """Minimal web review UI: catalog, review queue, EDL editor, render.
 
 Binds to localhost only; no auth (like DecisionMCP's server — local tooling).
-The UI is a single static page + JSON API; EDL edits are full-list replaces
-(reorder/remove/trim happen client-side, then save), and human review
-decisions land straight in the segments table.
+A middleware rejects any request whose ``Host`` header is not localhost, so a
+browser tab cannot reach the API via DNS rebinding. The UI is a single static
+page + JSON API; EDL edits are full-list replaces (reorder/remove/trim happen
+client-side, then save), and human review decisions land straight in the
+segments table.
 
 The app surface also covers: settings (edits ``.env`` in place — the source
 of truth pydantic-settings reads; secrets never round-trip), first-run setup
@@ -19,8 +21,8 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import agent as agent_mod
@@ -167,13 +169,33 @@ class JobRunner:
         return job
 
     def list(self) -> list[dict]:
-        return [j.view() for j in sorted(self._jobs.values(),
-                                         key=lambda j: -j.started)]
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: -j.started)
+        return [j.view() for j in jobs]
+
+
+# The API is unauthenticated; anything answering a non-loopback Host header is
+# reachable by DNS rebinding from a random web page in the user's browser.
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="AutoVid review", docs_url=None, redoc_url=None)
+
+    @app.middleware("http")
+    async def localhost_only(request: Request, call_next):
+        header = request.headers.get("host") or ""
+        if header.startswith("["):  # bracketed IPv6, e.g. [::1]:8766
+            host = header[1:header.index("]") if "]" in header else len(header)]
+        elif header.count(":") == 1:
+            host = header.rsplit(":", 1)[0]
+        else:
+            host = header
+        if host.lower() not in _ALLOWED_HOSTS:
+            return JSONResponse({"detail": "localhost only"}, status_code=403)
+        return await call_next(request)
+
     holder = {"settings": settings}  # refreshed after settings saves
     runner = JobRunner()
 
@@ -494,6 +516,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/storyboards/{storyboard_id}/compile")
     def storyboards_compile(storyboard_id: str) -> dict:
         c = conn()
+        try:
+            doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
         try:
             board = doc_mod.compile_to_edl(c, storyboard_id)
         except AutoVidError as e:

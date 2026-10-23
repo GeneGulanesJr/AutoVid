@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..errors import AutoVidError
 from .bins import ffprobe_path
 
 
@@ -74,7 +75,9 @@ def _probe_uncached(path: str) -> MediaInfo:
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffprobe failed for {path}: {proc.stderr.strip()[:400]}")
+        # AutoVidError, not RuntimeError: callers (web job targets) catch the
+        # app's error type to degrade gracefully instead of failing the job.
+        raise AutoVidError(f"ffprobe failed for {path}: {proc.stderr.strip()[:400]}")
     data = json.loads(proc.stdout or "{}")
 
     info = MediaInfo(

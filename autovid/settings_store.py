@@ -53,7 +53,9 @@ EDITABLE_KEYS = {f["key"] for g in SETTING_GROUPS for f in g["fields"]}
 def read_env_lines(env_path: Path | None = None) -> list[str]:
     p = env_path or ENV_PATH
     if p.exists():
-        return p.read_text(encoding="utf-8").splitlines()
+        # utf-8-sig: a BOM from "UTF-8 with BOM" editors must not corrupt the
+        # first key's name.
+        return p.read_text(encoding="utf-8-sig").splitlines()
     return []
 
 
@@ -66,10 +68,10 @@ def upsert_env_values(values: dict[str, str], env_path: Path | None = None) -> N
     p = env_path or ENV_PATH
     if not p.exists():
         example = REPO_ROOT / ".env.example"
-        lines = (example.read_text(encoding="utf-8").splitlines()
+        lines = (example.read_text(encoding="utf-8-sig").splitlines()
                  if example.exists() else [])
     else:
-        lines = p.read_text(encoding="utf-8").splitlines()
+        lines = p.read_text(encoding="utf-8-sig").splitlines()
 
     remaining = dict(values)
     out: list[str] = []
