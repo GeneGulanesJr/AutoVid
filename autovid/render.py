@@ -4,21 +4,70 @@ All clips come from :mod:`autovid.ffmpeg_io.clips` (same libx264/aac
 parameters), so a lossless concat copy is safe and fast. Transitions marked
 ``fade`` become fade-to/from-black on the affected clip (re-encode of that
 clip only). The render never touches originals; output lands in
-``catalog/renders/<edl_id>/``.
+``catalog/renders/<edl_id>/``. A byte-range lock file makes concurrent
+renders of the same EDL (e.g. CLI and web) fail fast instead of corrupting
+each other's staged clips.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import Settings
 from .edl import EDL
 from .errors import AutoVidError
 from .ffmpeg_io.bins import ffmpeg_path
+from .organize import slugify
 
 logger = logging.getLogger(__name__)
+
+try:
+    import msvcrt  # windows
+except ImportError:  # posix
+    msvcrt = None  # type: ignore[assignment]
+try:
+    import fcntl  # posix
+except ImportError:  # windows
+    fcntl = None  # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def _render_lock(lock_file: Path) -> Iterator[None]:
+    """One render per EDL dir across processes.
+
+    A byte-range lock (msvcrt on Windows, flock on POSIX) is released by the
+    OS when the owning process dies — a killed render can never wedge future
+    ones, which is why this is not a mkdir/pidfile lock.
+    """
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, "a+") as fh:
+        try:
+            if msvcrt is not None:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise AutoVidError(
+                f"another render of this EDL is already running "
+                f"(lock: {lock_file.name})"
+            ) from e
+        try:
+            yield
+        finally:
+            if msvcrt is not None:
+                with contextlib.suppress(OSError):
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _concat_line(path: Path) -> str:
+    """One concat-demuxer ``file`` directive, safe for ``'`` in the path."""
+    return "file '{}'".format(path.as_posix().replace("'", "'\\''"))
 
 
 def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
@@ -33,10 +82,10 @@ def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
     if fade_out:
         vf.append(f"fade=t=out:st={max(duration - fade_len, 0):.3f}:d={fade_len:.3f}")
     cmd = [
-        ffmpeg_path(), "-y", "-v", "error", "-i", str(src),
+        ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-i", str(src),
         "-vf", ",".join(vf),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-c:a", "aac", str(dst),
+        "-c:a", "copy", str(dst),  # fade is video-only; clips are already AAC
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0 or not dst.exists():
@@ -70,7 +119,9 @@ def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]
       whole scene span (the classic storyboard case).
     - Music-driven items trim sub-spans of a scene, so each such item gets an
       accurate per-item clip cut from the source (staged in the render dir —
-      reproducible, never written back over the scene clip).
+      reproducible, never written back over the scene clip). Staged clips are
+      named by provenance ``(segment, start, end)``, so re-renders reuse them
+      instead of re-extracting the whole timeline after a one-item edit.
     """
     from .edl import EDLItem
     from .ffmpeg_io.clips import extract_clip
@@ -102,9 +153,23 @@ def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]
         source = Path(row["source_path"])
         if not source.exists():
             raise AutoVidError(f"source file missing for segment {item.clip_id}: {source}")
-        out = settings.data_dir / "renders" / board.id / f"item_{i:04d}.mp4"
-        extract_clip(source, out, start_s=item.source_start, end_s=item.source_end)
-        pairs.append((item, out))
+        staged = (
+            settings.data_dir / "renders" / board.id
+            / f"item_{item.clip_id}_{item.source_start:.3f}-{item.source_end:.3f}.mp4"
+        )
+        if staged.exists():
+            try:
+                if abs(probe(staged).duration_s - item_span) < 0.25:
+                    pairs.append((item, staged))
+                    continue
+            except Exception:  # noqa: BLE001 — partial/corrupt staged clip
+                pass  # fall through: re-extract over it (a killed render must
+                # never poison every future render of this EDL)
+        # .part.mp4, not .part: ffmpeg picks its muxer from the extension
+        tmp = staged.with_name(staged.stem + ".part.mp4")
+        extract_clip(source, tmp, start_s=item.source_start, end_s=item.source_end)
+        tmp.replace(staged)
+        pairs.append((item, staged))
     return pairs
 
 
@@ -114,21 +179,41 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
     With ``board.music_path`` set (music-driven editing), the music is muxed
     over the stitched video: video length always wins, the audio is padded if
     short and faded out over the last 2 s.
+
+    The EDL is validated first (unknown segments, bad ranges, timeline
+    overlaps, mixed resolutions) — rendering an invalid cut wastes minutes of
+    ffmpeg only to produce a broken file.
     """
-    from .ffmpeg_io.probe import probe
+    from .edl import validate_edl
 
     # ffmpeg resolves concat-list entries against the list's folder, so a relative --data-dir breaks.
     settings = settings.model_copy(update={"data_dir": settings.data_dir.resolve()})
+    validation = validate_edl(conn, board)
+    if not validation.ok:
+        details = "; ".join(e.message for e in validation.errors)
+        raise AutoVidError(f"EDL failed validation: {details}")
+
+    out_dir = settings.data_dir / "renders" / board.id
+    with _render_lock(out_dir / ".render.lock"):
+        return _render_unlocked(conn, settings, board, out_dir)
+
+
+def _render_unlocked(conn, settings: Settings, board: EDL, out_dir: Path) -> Path:
+    """The render itself; caller holds the per-EDL lock."""
+    from .ffmpeg_io.probe import probe
+
     pairs = _materialize(conn, settings, board)
     if not pairs:
         raise AutoVidError("EDL has no items")
 
-    out_dir = settings.data_dir / "renders" / board.id
     out_dir.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
     concat_file = out_dir / "concat.txt"
     concat_out = out_dir / "_video_only.mp4"
-    out_path = out_dir / f"{board.name}.mp4"
+    # The name is client- and LLM-settable free text — slugify it so it can
+    # never escape out_dir or carry Windows-illegal characters. The EDL keeps
+    # its display name; only the file on disk is sanitized.
+    out_path = out_dir / f"{slugify(board.name)}.mp4"
     try:
         for i, (item, path) in enumerate(pairs):
             fade_in = item.transition_in == "fade"
@@ -142,7 +227,7 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
                 staged.append(path)
 
         # Stream-copy concat needs identical streams. Clips from different cameras (size, frame rate,
-        # no audio track) otherwise leave timestamp gaps, so conform them all to the first clip.
+        # no audio track) otherwise leave timestamp gaps, so conform them all to the majority format.
         infos = [probe(p) for p in staged]
         if len({(i.width, i.height, round(i.fps, 2), i.has_audio) for i in infos}) > 1:
             # the format most clips (by length) already have, so the majority is not letterboxed
@@ -154,51 +239,59 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
                       for k, (p, i) in enumerate(zip(staged, infos))]
 
         concat_file.write_text(
-            "\n".join(f"file '{p.as_posix()}'" for p in staged), encoding="utf-8"
+            "\n".join(_concat_line(p) for p in staged), encoding="utf-8"
         )
-        cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-c", "copy", "-movflags", "+faststart", str(concat_out),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if proc.returncode != 0 or not concat_out.exists():
-            raise AutoVidError(
-                f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
-            )
-
         if board.music_path:
-            _mux_music(concat_out, Path(board.music_path), out_path)
+            # Single pass: the concat demuxer feeds the muxer directly, so the
+            # stitched video is never written to disk just to be re-read.
+            _render_with_music(concat_file, Path(board.music_path), staged, out_path)
         else:
+            cmd = [
+                ffmpeg_path(), "-nostdin", "-y", "-v", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                "-c", "copy", "-movflags", "+faststart", str(concat_out),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if proc.returncode != 0 or not concat_out.exists():
+                raise AutoVidError(
+                    f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
+                )
             concat_out.replace(out_path)
         if not out_path.exists():
             raise AutoVidError("render produced no output")
         return out_path
     finally:
-        # keep only the final render; staged fades and per-item clips are
-        # reproducible from the EDL
+        # faded intermediates and staged clips no longer referenced by this
+        # render are reproducible from the EDL; referenced item clips stay so
+        # the next re-render skips their extraction
         for p in staged:
             if p.name.startswith(("faded_", "conformed_")):
                 p.unlink(missing_ok=True)
+        keep = {p.resolve() for _, p in pairs}
         for p in out_dir.glob("item_*.mp4"):
-            p.unlink(missing_ok=True)
+            if p.resolve() not in keep:
+                p.unlink(missing_ok=True)  # includes *.part.mp4 leftovers
         concat_file.unlink(missing_ok=True)
         concat_out.unlink(missing_ok=True)
 
 
-def _mux_music(video: Path, music: Path, out_path: Path) -> None:
-    """Lay the music over the stitched video: pad if short, fade out 2 s.
+def _render_with_music(
+    concat_file: Path, music: Path, staged: list[Path], out_path: Path
+) -> None:
+    """Concat + music mux in one ffmpeg pass: video stream-copied from the
+    concat demuxer, music padded if short and faded out over the last 2 s.
 
     ``-shortest`` plus infinite audio pad (``apad``) means the video track
     always defines the output length — a short BGM never truncates the cut.
     """
     from .ffmpeg_io.probe import probe
 
-    duration = max(probe(video).duration_s, 0.5)
+    duration = sum(max(probe(p).duration_s, 0.0) for p in staged)
     fade_st = max(duration - 2.0, 0.0)
     cmd = [
-        ffmpeg_path(), "-y", "-v", "error",
-        "-i", str(video), "-i", str(music),
+        ffmpeg_path(), "-nostdin", "-y", "-v", "error",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-i", str(music),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy",
         "-af", f"apad,afade=t=out:st={fade_st:.3f}:d=2",
@@ -207,4 +300,6 @@ def _mux_music(video: Path, music: Path, out_path: Path) -> None:
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0 or not out_path.exists():
-        raise AutoVidError(f"music mux failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}")
+        raise AutoVidError(
+            f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
+        )

@@ -36,7 +36,7 @@ def extract_clip(
     if end_s <= start_s:
         raise AutoVidError(f"invalid clip span [{start_s:.3f}, {end_s:.3f})")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [ffmpeg_path(), "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(source)]
+    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(source)]
     if reencode:
         cmd += ["-t", f"{end_s - start_s:.3f}",
                 "-c:v", "libx264", "-preset", preset, "-crf", str(crf),

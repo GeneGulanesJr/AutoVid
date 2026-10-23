@@ -96,8 +96,11 @@ def _add_dense_frames(
     dense_dir = settings.assets_dir / asset_id / "dense" / f"{start:.3f}"
     existing = {round(r["ts"], 3) for r in _frames_in(conn, asset_id, start, end, "dense")}
     added = 0
+    # Seek-scoped extraction: decode only this window's span, not the whole
+    # source (which previously cost one full decode per densified window).
     for ts, path in extract_periodic_frames(
-        source, dense_dir, interval_s=interval_s, width=512, prefix=f"d{start:.3f}"
+        source, dense_dir, interval_s=interval_s, width=512, prefix=f"d{start:.3f}",
+        start_s=start, end_s=end,
     ):
         if start <= ts < end and round(ts, 3) not in existing:
             conn.execute(
@@ -141,7 +144,9 @@ def analyze_asset(
         window_s = (settings.coarse_window_s if duration > settings.fine_window_max_duration_s
                     else min(settings.coarse_window_s, settings.fine_window_s))
         windows = build_windows(duration, coarse_window_s=window_s)
-        conn.execute("DELETE FROM analyses WHERE asset_id = ?", (asset_id,))  # replace, never duplicate
+        # Per-window upserts cannot collide, but a re-run with a different window length (60 s vs 8 s) would
+        # leave the old, overlapping windows behind: replace the asset's map as a whole.
+        conn.execute("DELETE FROM analyses WHERE asset_id = ?", (asset_id,))
         conn.commit()
 
         previous_description: str | None = None
@@ -194,7 +199,7 @@ def analyze_asset(
                         settings.assets_dir / asset_id / "dense"
                         / f"insp_{start:.3f}_{ts:.3f}.jpg"
                     )
-                    p_path = frame_at(source, ts, path, width=512)
+                    p_path = frame_at(source, ts, path, width=512)[1]
                     conn.execute(
                         "INSERT OR IGNORE INTO frames (asset_id, ts, kind, path) "
                         "VALUES (?, ?, 'dense', ?)",
@@ -218,6 +223,8 @@ def analyze_asset(
                 result.unparsed += 1
                 result.notes.append(f"[{start:.1f}-{end:.1f}s] VLM unavailable: {e}")
 
+            window_prompt_tokens = sum(e["prompt_tokens"] for e in vlm.usage)
+            window_completion_tokens = sum(e["completion_tokens"] for e in vlm.usage)
             for entry in vlm.usage:
                 result.prompt_tokens += entry["prompt_tokens"]
                 result.completion_tokens += entry["completion_tokens"]
@@ -237,7 +244,15 @@ def analyze_asset(
                 """INSERT INTO analyses (asset_id, window_start, window_end, provider,
                                          model, response_json, prompt_tokens,
                                          completion_tokens, confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(asset_id, window_start) DO UPDATE SET
+                       window_end = excluded.window_end,
+                       provider = excluded.provider,
+                       model = excluded.model,
+                       response_json = excluded.response_json,
+                       prompt_tokens = excluded.prompt_tokens,
+                       completion_tokens = excluded.completion_tokens,
+                       confidence = excluded.confidence""",
                 (
                     asset_id, start, end,
                     settings.vlm_model if analysis else "none",
@@ -248,7 +263,7 @@ def analyze_asset(
                         "flagged": flagged,
                         "engine": action.engine,
                     }),
-                    0, 0,
+                    window_prompt_tokens, window_completion_tokens,
                     round(1.0 - uncertainty, 3),
                 ),
             )

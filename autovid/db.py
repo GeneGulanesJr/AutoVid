@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # 2: transcripts (every statement is IF NOT EXISTS, so v1 catalogs upgrade in place)
+SCHEMA_VERSION = 5  # 5: transcripts table (CREATE IF NOT EXISTS, so older catalogs upgrade in place)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -44,7 +44,6 @@ CREATE TABLE IF NOT EXISTS frames (
     motion_score REAL,
     UNIQUE (asset_id, kind, ts)
 );
-CREATE INDEX IF NOT EXISTS idx_frames_asset ON frames(asset_id, kind, ts);
 
 CREATE TABLE IF NOT EXISTS scenes (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +68,6 @@ CREATE TABLE IF NOT EXISTS analyses (
     confidence        REAL,
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_analyses_asset ON analyses(asset_id, window_start);
 
 CREATE TABLE IF NOT EXISTS segments (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,8 +118,50 @@ CREATE TABLE IF NOT EXISTS edls (
     style             TEXT NOT NULL DEFAULT '',
     target_duration_s REAL NOT NULL DEFAULT 0,
     items_json        TEXT NOT NULL DEFAULT '[]',
+    storyboard_id     TEXT,              -- EDL compiled from a storyboard (v4)
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Storyboards (v4): the central planning artifact. Scenes reference catalog
+-- segments; versions are append-only (restore = save as a new version).
+CREATE TABLE IF NOT EXISTS storyboards (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    objective         TEXT NOT NULL DEFAULT '',
+    style             TEXT NOT NULL DEFAULT '',
+    target_duration_s REAL NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'draft',  -- draft | approved
+    current_version   INTEGER NOT NULL DEFAULT 0,
+    music_path        TEXT,
+    mode              TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS storyboard_versions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    storyboard_id TEXT NOT NULL REFERENCES storyboards(id),
+    version       INTEGER NOT NULL,
+    origin        TEXT NOT NULL DEFAULT 'user_edit',
+        -- agent | planner | user_edit | script_edit | restore
+    note          TEXT,
+    document_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (storyboard_id, version)
+);
+
+-- Script (v4): narration / dialogue / on-screen text per story beat —
+-- narrative only, no timeline data. Storyboard scenes reference beats by id.
+CREATE TABLE IF NOT EXISTS scripts (
+    id            TEXT PRIMARY KEY,
+    storyboard_id TEXT NOT NULL UNIQUE REFERENCES storyboards(id),
+    title         TEXT NOT NULL DEFAULT '',
+    synopsis      TEXT NOT NULL DEFAULT '',
+    beats_json    TEXT NOT NULL DEFAULT '[]',
+    origin        TEXT NOT NULL DEFAULT 'planner',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Per-asset stage ledger; resumability = skip (asset, stage) rows marked done.
@@ -151,6 +191,22 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- v1 → v3 migration (idempotent): analyses had no window uniqueness, so
+-- re-runs duplicated rows and doubled downstream model work. Keep the
+-- newest row per window, then enforce one row per (asset, window).
+-- The constraint MUST be a named unique index (not an inline table
+-- UNIQUE): CREATE TABLE IF NOT EXISTS is a no-op on pre-existing
+-- catalogs, and the upsert in analyze_asset needs the index to exist
+-- there too.
+DELETE FROM analyses WHERE id NOT IN (
+    SELECT MAX(id) FROM analyses GROUP BY asset_id, window_start
+);
+DROP INDEX IF EXISTS idx_frames_asset;    -- duplicate of the UNIQUE autoindex
+DROP INDEX IF EXISTS idx_analyses_asset;  -- superseded by the unique index below
+CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_asset_window
+    ON analyses(asset_id, window_start);
+CREATE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
 """
 
 
@@ -163,6 +219,9 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # WAL + NORMAL: commits skip the per-transaction fsync (measured ~50x
+    # cheaper here); WAL still guarantees consistency after an OS crash.
+    conn.execute("PRAGMA synchronous=NORMAL")
     init_db(conn)
     return conn
 
@@ -172,6 +231,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     if version >= SCHEMA_VERSION:
         return
     conn.executescript(_SCHEMA)
+    if version < 4:
+        # v3 → v4: storyboards/scripts are new tables (CREATE IF NOT EXISTS
+        # covers them), but the edls.storyboard_id column must be added to
+        # catalogs created before v4 — ALTER has no IF NOT EXISTS.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(edls)")}
+        if "storyboard_id" not in cols:
+            conn.execute("ALTER TABLE edls ADD COLUMN storyboard_id TEXT")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 

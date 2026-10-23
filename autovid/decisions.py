@@ -12,10 +12,12 @@ Every decision — heuristic or model — is logged to the ``decisions`` table
 with the action, confidence, engine and elapsed time, so decision-guided
 processing stays measurable against the fixed-interval baseline.
 
-Note: ``DecisionClient`` is sync (the pipeline is sync); each model call opens
-a short-lived MCP session over HTTP, which costs a few local milliseconds —
-negligible next to model latency, and it survives server restarts between
-calls.
+Note: ``DecisionClient`` is sync (the pipeline is sync); MCP calls run on a
+private background event loop over ONE cached streamable-HTTP session, so the
+connect+initialize handshake is paid once per client instead of once per call
+(≈100+ calls per hour of footage). Any transport failure drops the cached
+session, so the next call reconnects — server restarts between calls are
+survived exactly as before.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -138,6 +141,24 @@ class DecisionClient:
         self.settings = settings
         self.conn = conn
         self.mode = settings.decision_mode
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_lock = threading.Lock()
+        self._session: Any = None  # mcp ClientSession (lazy import keeps startup light)
+        self._session_stack: Any = None  # AsyncExitStack owning the session's contexts
+        self._session_lock: asyncio.Lock | None = None
+
+    def close(self) -> None:
+        """Release the cached MCP session and the background loop (idempotent)."""
+        with self._loop_lock:
+            loop, self._loop = self._loop, None
+        if loop is None or loop.is_closed():
+            return
+        if loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self._reset_session(), loop).result(timeout=10)
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                logger.debug("session teardown failed", exc_info=True)
+        loop.call_soon_threadsafe(loop.stop)
 
     # -- public API ----------------------------------------------------------
 
@@ -332,25 +353,71 @@ class DecisionClient:
 
     # -- transport -----------------------------------------------------------
 
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """Private background loop, so sessions outlive individual sync calls."""
+        with self._loop_lock:
+            if self._loop is None or self._loop.is_closed():
+                self._loop = asyncio.new_event_loop()
+                threading.Thread(
+                    target=self._loop.run_forever, daemon=True, name="decisionmcp-client"
+                ).start()
+            return self._loop
+
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict:
-        """One MCP call; returns the parsed tool output. Raises DecisionUnavailable."""
+        """One MCP call over the cached session; reconnects after any failure."""
         try:
-            return asyncio.run(self._call_tool_async(name, arguments))
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_tool_async(name, arguments), self._ensure_loop()
+            )
+            return future.result()
         except DecisionUnavailable:
             raise
         except Exception as e:  # noqa: BLE001 — any transport failure is "unavailable"
             raise DecisionUnavailable(f"{name}: {e}") from e
 
-    async def _call_tool_async(self, name: str, arguments: dict[str, Any]) -> dict:
+    async def _get_session(self) -> Any:
+        from contextlib import AsyncExitStack
+
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
-        async with streamablehttp_client(self.settings.decisionmcp_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await asyncio.wait_for(session.initialize(), timeout=10.0)
-                result = await asyncio.wait_for(
-                    session.call_tool(name, arguments=arguments), timeout=60.0
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self._session is not None:
+                return self._session
+            stack = AsyncExitStack()
+            try:
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(self.settings.decisionmcp_url)
                 )
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await asyncio.wait_for(session.initialize(), timeout=10.0)
+            except BaseException:
+                await stack.aclose()
+                raise
+            self._session_stack = stack
+            self._session = session
+            return session
+
+    async def _reset_session(self) -> None:
+        stack, self._session_stack, self._session = self._session_stack, None, None
+        self._session_lock = None  # a Lock binds to its loop; never reuse one
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception:  # noqa: BLE001 — closing must never mask the real error
+                logger.debug("MCP session close failed", exc_info=True)
+
+    async def _call_tool_async(self, name: str, arguments: dict[str, Any]) -> dict:
+        try:
+            session = await self._get_session()
+            result = await asyncio.wait_for(
+                session.call_tool(name, arguments=arguments), timeout=60.0
+            )
+        except Exception:  # noqa: BLE001 — broken/hung session → fresh one next call
+            await self._reset_session()
+            raise
         if getattr(result, "isError", False):
             text = result.content[0].text if result.content else "unknown error"
             raise DecisionUnavailable(f"{name} error: {text}")
@@ -518,11 +585,14 @@ class DecisionClient:
         if self.conn is None:
             return
         try:
+            payload_json = json.dumps(payload, default=str)
+            if len(payload_json) > 4096:  # audit trail, not a data store — cap dumps
+                payload_json = payload_json[:4096]
             self.conn.execute(
                 """INSERT INTO decisions (asset_id, tool, action, payload_json,
                                           confidence, engine_version, elapsed_ms)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (asset_id, tool, action, json.dumps(payload, default=str),
+                (asset_id, tool, action, payload_json,
                  confidence, engine, elapsed_ms),
             )
             self.conn.commit()

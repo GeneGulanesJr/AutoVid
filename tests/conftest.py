@@ -1,6 +1,7 @@
 """Shared fixtures: tiny real videos generated with the vendored ffmpeg."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -67,3 +68,37 @@ def video_folder(tmp_path: Path) -> Path:
     make_video(sub / "clip_c.mov", duration=3)
     (folder / "notes.txt").write_text("not a video")
     return folder
+
+
+def seed_asset(conn, asset_id: str = "a_test", *, duration: float = 30.0,
+               width: int = 160, height: int = 120, fps: float = 12.0,
+               path: str | None = None) -> str:
+    """A catalog asset row without running the pipeline (FK target for tests)."""
+    conn.execute(
+        """INSERT INTO assets (id, sha256, path, original_path, original_name,
+                               status, duration_s, width, height, fps)
+           VALUES (?, ?, ?, ?, ?, 'organized', ?, ?, ?, ?)
+           ON CONFLICT(id) DO NOTHING""",
+        (asset_id, f"hash-{asset_id}", path or f"{asset_id}.mp4",
+         path or f"{asset_id}.mp4", f"{asset_id}.mp4", duration, width, height, fps),
+    )
+    conn.commit()
+    return asset_id
+
+
+def seed_segment(conn, asset_id: str, segment_id: int, *, start: float = 0.0,
+                 end: float = 10.0, description: str = "a test scene",
+                 tags: list[str] | None = None, highlight: float = 0.8,
+                 confidence: float = 0.9) -> int:
+    """An accepted segment — storyboard-eligible by the same rule as the
+    pipeline (verdict accept, review not pending)."""
+    conn.execute(
+        """INSERT INTO segments (id, asset_id, start_s, end_s, description, tags_json,
+                                 highlight_score, decision_confidence, verdict, review_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accept', 'auto')
+           ON CONFLICT(id) DO NOTHING""",
+        (segment_id, asset_id, start, end, description,
+         json.dumps(tags or ["test"]), highlight, confidence),
+    )
+    conn.commit()
+    return segment_id

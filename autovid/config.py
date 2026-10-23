@@ -1,10 +1,13 @@
 """AutoVid settings.
 
-Every field maps to an ``AUTOVID_*`` environment variable (or a ``.env`` file
-in the working directory), mirroring DecisionMCP's pydantic-settings config.
+Every field maps to an ``AUTOVID_*`` environment variable (or the ``.env``
+file in the repo root), mirroring DecisionMCP's pydantic-settings config.
+The ``.env`` path is absolute so the desktop launcher works from any
+working directory.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,12 +17,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="AUTOVID_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="AUTOVID_", env_file=REPO_ROOT / ".env", extra="ignore"
+    )
 
     # Catalog root: SQLite DB, thumbnails, clips, renders. Originals stay put.
     data_dir: Path = REPO_ROOT / "catalog"
 
-    # ffmpeg/ffprobe location. Empty → PATH → vendored .tools build.
+    # ffmpeg/ffprobe location. Empty → PATH → vendored .tools build. The
+    # ffmpeg_io layer reads the raw AUTOVID_FFMPEG_DIR environment variable
+    # (get_settings re-exports it below, so a .env-only value works too).
     ffmpeg_dir: Path | None = None
 
     # Decision layer (DecisionMCP, streamable HTTP MCP).
@@ -49,11 +56,19 @@ class Settings(BaseSettings):
     whisper_device: str = "auto"
     whisper_compute_type: str = "auto"
 
+    # Storyboard Agent (text-only planner over the catalog digest). Empty →
+    # same model as the VLM; point it at a cheaper/fast text model if desired.
+    agent_model: str = ""
+
     # Baseline sampling policy (the decision layer may override per region).
     grid_interval_s: float = 2.0
     thumb_interval_s: float = 30.0
     thumb_width: int = 320
     scene_threshold: float = 0.3
+
+    # Windows/scenes below this VLM highlight score never become candidate
+    # clips (lower it for sparse/abstract footage).
+    highlight_threshold: float = 0.4
 
     # Hierarchical segmentation, phase 1: coarse fixed-duration analysis
     # windows. A 1-hour file becomes 60 ~1-minute windows, each described by
@@ -77,4 +92,11 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    # ffmpeg_io resolves binaries from the process environment; re-export a
+    # value that only came from .env so it takes effect. Runs before the
+    # first ffmpeg call (every entry point builds settings first), and tests
+    # construct Settings directly, so this never fires under pytest.
+    if settings.ffmpeg_dir is not None and "AUTOVID_FFMPEG_DIR" not in os.environ:
+        os.environ["AUTOVID_FFMPEG_DIR"] = str(settings.ffmpeg_dir)
+    return settings

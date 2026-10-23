@@ -41,6 +41,15 @@
   .jobbox .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:6px 0; }
   .jobbox .bar i { display:block; height:100%; background:var(--acc); transition:width .4s; }
   .log { font-family:Consolas,monospace; font-size:12px; color:var(--dim); max-height:120px; overflow:auto; white-space:pre-wrap; }
+  .sceneCard { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; display:flex; gap:12px; }
+  .sceneCard.selected { border-color:var(--acc); }
+  .sceneCard video { width:180px; height:101px; object-fit:cover; }
+  .sceneCard .grow { flex:1; }
+  .sceneCard input[type=text], .sceneCard input[type=number] { padding:3px 6px; }
+  .sceneCard textarea { width:100%; font:inherit; }
+  .shotRow { display:flex; gap:6px; align-items:center; margin-top:4px; flex-wrap:wrap; }
+  .beatRow { display:flex; gap:6px; align-items:flex-start; margin-bottom:6px; }
+  .beatRow textarea { flex:1; font:inherit; min-height:34px; }
 </style>
 </head>
 <body>
@@ -52,6 +61,7 @@
     <button data-view="catalog">Catalog</button>
     <button data-view="review">Review</button>
     <button data-view="music">Music</button>
+    <button data-view="board">Storyboard</button>
     <button data-view="edl">EDL</button>
   </nav>
   <span class="dim" id="statusLine"></span>
@@ -136,6 +146,37 @@
     <p class="dim" id="musicInfo"></p>
   </section>
 
+  <!-- STORYBOARD -->
+  <section id="view-board" class="hidden">
+    <div class="card">
+      <h4>Generate a storyboard</h4>
+      <div class="toolbar">
+        <input id="sbObjective" placeholder="objective — e.g. 60s hike recap" size="30">
+        <input id="sbDuration" type="number" value="30" min="5" style="width:80px" title="target seconds">
+        <span class="dim">s target</span>
+        <select id="sbStyle"><option>cinematic</option><option>fast_paced</option><option>social</option><option>informative</option></select>
+        <button class="act primary" onclick="generateBoard()">✦ Generate</button>
+      </div>
+      <p class="dim">The agent plans from the segment catalog only — it cannot invent footage
+      (invalid drafts get one repair round, then the deterministic planner takes over).
+      Every save is a new version; restore any of them.</p>
+    </div>
+    <div class="toolbar">
+      <select id="sbSelect" onchange="loadBoard()"></select>
+      <select id="sbVersions" title="version history"></select>
+      <button class="act" onclick="restoreVersion()">⟲ restore</button>
+      <button class="act" onclick="saveBoard()">💾 save</button>
+      <button class="act" onclick="regenAll()">✦ regen all</button>
+      <button class="act" id="approveBtn" onclick="toggleApprove()"></button>
+      <button class="act primary" onclick="compileBoard()">→ compile EDL</button>
+      <span id="sbInfo" class="dim"></span>
+    </div>
+    <div class="card" id="scriptPanel"></div>
+    <div id="sceneList"></div>
+    <div class="card hidden" id="missingPanel"></div>
+    <p class="dim" id="sbMsg"></p>
+  </section>
+
   <!-- EDL -->
   <section id="view-edl" class="hidden">
     <div class="toolbar">
@@ -144,6 +185,7 @@
       <button class="act" onclick="moveEdl(1)">↓ down</button>
       <button class="act" onclick="removeItem()">✕ remove</button>
       <button class="act" onclick="saveEdl()">Save</button>
+      <button class="act" onclick="validateEdl()">✓ Validate</button>
       <button class="act" onclick="renderEdl()">▶ Render</button>
       <span id="edlInfo" class="dim"></span>
     </div>
@@ -164,12 +206,13 @@ async function api(path, opts) {
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
-  ["setup","pipeline","catalog","review","music","edl"].forEach(v => $("#view-"+v).classList.toggle("hidden", v !== b.dataset.view));
+  ["setup","pipeline","catalog","review","music","board","edl"].forEach(v => $("#view-"+v).classList.toggle("hidden", v !== b.dataset.view));
   if (b.dataset.view === "setup") loadSetup();
   if (b.dataset.view === "pipeline") { loadAssets(); refreshJobs(); }
   if (b.dataset.view === "catalog") { loadAssets(); loadSegments(); }
   if (b.dataset.view === "review") loadReview();
   if (b.dataset.view === "music") loadEdlList();
+  if (b.dataset.view === "board") loadBoardView();
   if (b.dataset.view === "edl") loadEdlList();
 });
 const pill = (t, c) => `<span class="pill ${c||''}">${t}</span>`;
@@ -177,13 +220,13 @@ const pill = (t, c) => `<span class="pill ${c||''}">${t}</span>`;
 async function loadSetup() {
   const s = await api("/api/setup");
   $("#setupChecks").innerHTML = s.checks.map(c =>
-    `<div class="check">${c.ok ? pill("OK","ok") : pill("missing","bad")} <b>${c.name}</b> <span class="dim">${c.detail}</span></div>`).join("");
+    `<div class="check">${c.ok ? pill("OK","ok") : pill("missing","bad")} <b>${esc(c.name)}</b> <span class="dim">${esc(c.detail)}</span></div>`).join("");
   const cfg = await api("/api/settings");
-  $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${g.group}</h4>` +
-    g.fields.map(f => `<div class="field"><label>${f.label}</label>
-      <input id="set_${f.key}" value="${f.value}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
+  $("#settingsGroups").innerHTML = cfg.groups.map(g => `<h4>${esc(g.group)}</h4>` +
+    g.fields.map(f => `<div class="field"><label>${esc(f.label)}</label>
+      <input id="set_${f.key}" value="${esc(f.value)}" data-orig="${esc(f.value)}" ${f.key === "AUTOVID_VLM_API_KEY" ? 'placeholder="paste key — shown masked"':''}>
       ${EXTRA[f.key] || ""}
-      <span class="hint">${f.help || ""} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
+      <span class="hint">${esc(f.help || "")} ${f.set ? "✓ set" : ""}</span></div>`).join("")).join("");
 }
 const BASE_URLS = {
   "Anthropic": "https://api.anthropic.com/v1",
@@ -225,8 +268,9 @@ async function saveSettings() {
   const values = {};
   document.querySelectorAll("[id^='set_']").forEach(inp => {
     const key = inp.id.slice(4);
-    // empty = leave unchanged; masked secret = never write the mask back
-    if (inp.value !== "" && !(key.endsWith("_API_KEY") && inp.value.includes("…"))) values[key] = inp.value;
+    // only fields the user actually changed — masked secrets (and any
+    // untouched field) must never be written back over the real value
+    if (inp.value !== "" && inp.value !== inp.dataset.orig) values[key] = inp.value;
   });
   await api("/api/settings", {method:"PUT", body:{values}});
   $("#settingsMsg").textContent = "saved " + new Date().toLocaleTimeString();
@@ -240,7 +284,6 @@ async function startIngest() {
   const j = await api("/api/pipeline/ingest", {method:"POST", body:{folder, recursive: $("#recursive").checked}});
   watch(j.id);
 }
-const esc = s => String(s).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
 async function writeScript() {
   const objective = $("#scObjective").value.trim();
   if (!objective) return;
@@ -255,7 +298,7 @@ async function startStage(stage) {
   try { const j = await api(`/api/pipeline/${stage}`, {method:"POST", body:{}}); watch(j.id); }
   catch (e) { $("#statusLine").textContent = e.message; }
 }
-function watch(id) {
+function watch(id, onDone) {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     const j = await api(`/api/jobs/${id}`);
@@ -265,16 +308,17 @@ function watch(id) {
       loadAssets();
       if (j.stage === "ingest") loadSegments();
       $("#statusLine").textContent = `${j.stage}: ${j.state}`;
+      if (onDone) onDone(j);
     }
   }, 1500);
 }
 function drawJob(j) {
   const pct = j.total ? Math.round(100 * j.done / j.total) : 0;
   $("#jobsPanel").innerHTML = `<div class="jobbox">
-    <b>${j.stage}</b> ${pill(j.state, j.state === "done" ? "ok" : j.state === "error" ? "bad" : "warn")}
-    <span class="dim">${j.done}/${j.total || "?"} ${j.current}</span>
+    <b>${esc(j.stage)}</b> ${pill(j.state, j.state === "done" ? "ok" : j.state === "error" ? "bad" : "warn")}
+    <span class="dim">${j.done}/${j.total || "?"} ${esc(j.current)}</span>
     <div class="bar"><i style="width:${pct}%"></i></div>
-    <div class="log">${(j.log || []).join("\n")}${j.error ? "\nERROR: " + j.error : ""}</div></div>`;
+    <div class="log">${esc((j.log || []).join("\n"))}${j.error ? "\nERROR: " + esc(j.error) : ""}</div></div>`;
 }
 async function refreshJobs() { /* jobs are ephemeral; panel redraws while watching */ }
 
@@ -282,7 +326,7 @@ async function refreshJobs() { /* jobs are ephemeral; panel redraws while watchi
 async function loadAssets() {
   const rows = await api("/api/assets");
   $("#assetTable tbody").innerHTML = rows.map(a => `<tr>
-    <td class="dim">${a.id}</td><td>${a.name}</td>
+    <td class="dim">${esc(a.id)}</td><td>${esc(a.name)}</td>
     <td>${pill(a.status, a.status === "error" ? "bad" : ["cut","organized"].includes(a.status) ? "ok" : "warn")}</td>
     <td>${a.duration_s.toFixed(1)}s</td><td>${a.segments}</td><td>${a.decisions}</td>
     <td>${a.duplicates.length || ""}</td></tr>`).join("");
@@ -295,19 +339,18 @@ async function loadSegments() {
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict || "—", s.verdict === "accept" ? "ok" : s.verdict === "reject" ? "bad" : "warn")}</td>
     <td>${s.highlight_score == null ? "" : s.highlight_score.toFixed(2)}</td>
-    <td>${s.description || ""}</td>
-    <td class="dim">${JSON.parse(s.tags_json || "[]").join(", ")}</td>
+    <td>${esc(s.description || "")}</td>
+    <td class="dim">${esc(JSON.parse(s.tags_json || "[]").join(", "))}</td>
     <td>${s.clip_path ? `<a href="/clips/${s.id}" target="_blank">clip</a>` : ""}</td></tr>`).join("");
 }
 async function loadReview() {
-  const all = await api("/api/segments");
-  const pending = all.filter(s => s.review_status === "pending");
+  const pending = await api("/api/segments?status=pending");
   $("#reviewTable tbody").innerHTML = pending.map(s => `<tr>
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict, "warn")}</td>
     <td>${s.decision_confidence == null ? "" : s.decision_confidence.toFixed(2)}</td>
-    <td>${s.description || ""}</td>
-    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
+    <td>${esc(s.description || "")}</td>
+    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted preload="none"></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
     <td><div class="row-actions">
       <button class="act" onclick="review(${s.id},'approved')">approve</button>
       <button class="act" onclick="review(${s.id},'rejected')">reject</button>
@@ -317,24 +360,31 @@ async function review(id, status) { await api(`/api/segments/${id}/review?status
 
 // ---- music ----
 async function planMusic() {
-  $("#musicInfo").textContent = "analyzing music, planning, rendering…";
+  $("#musicInfo").textContent = "analyzing music, planning, rendering… (watch Pipeline for progress)";
   try {
-    const out = await api("/api/music/plan", {method:"POST", body:{
+    const j = await api("/api/music/plan", {method:"POST", body:{
       music_path: $("#musicPath").value.trim(), objective: "", mode: $("#mvMode").value,
       style: $("#mvStyle").value, name: "music-cut", render: true}});
-    $("#musicInfo").innerHTML =
-      `${out.items} cuts over ${out.duration_s.toFixed(1)}s @ ${Math.round(out.tempo_bpm)} BPM` +
-      (out.render_path ? ` — <a href="/renders/${out.edl_id}/music-cut.mp4">open render</a>` :
-       out.render_error ? " (render failed: " + out.render_error + ")" : "");
-    if (out.render_path) $("#musicPreview").src = `/renders/${out.edl_id}/music-cut.mp4`;
-    loadEdlList();
+    watch(j.id, (done) => {
+      const out = done.result;
+      if (done.state !== "done" || !out) {
+        $("#musicInfo").textContent = "failed: " + (done.error || "unknown error");
+        return;
+      }
+      $("#musicInfo").innerHTML =
+        `${out.items} cuts over ${out.duration_s.toFixed(1)}s @ ${Math.round(out.tempo_bpm)} BPM` +
+        (out.render_path ? ` — <a href="/renders/${out.edl_id}/music-cut.mp4">open render</a>` :
+         out.render_error ? " (render failed: " + esc(out.render_error) + ")" : "");
+      if (out.render_path) $("#musicPreview").src = `/renders/${out.edl_id}/music-cut.mp4`;
+      loadEdlList();
+    });
   } catch (e) { $("#musicInfo").textContent = "failed: " + e.message; }
 }
 
 // ---- EDL editor ----
 async function loadEdlList() {
   const rows = await api("/api/edls");
-  $("#edlSelect").innerHTML = rows.map(e => `<option value="${e.id}">${e.name} (${e.id})</option>`).join("")
+  $("#edlSelect").innerHTML = rows.map(e => `<option value="${e.id}">${esc(e.name)} (${e.id})</option>`).join("")
     || '<option value="">no EDLs yet</option>';
   if (rows.length) { $("#edlSelect").value = rows[0].id; await loadEdl(); }
 }
@@ -349,7 +399,7 @@ function drawEdl() {
     <b>${i+1}</b>
     <span class="grow">seg ${it.clip_id} · src ${it.source_start.toFixed(1)}–${it.source_end.toFixed(1)}s
       ${it.timeline_start != null ? `· tl ${it.timeline_start.toFixed(1)}s` : ""}
-      <span class="dim">${it.beat_ref || ""}</span></span>
+      <span class="dim">${esc(it.beat_ref || "")}</span></span>
     <button class="act" onclick="selectItem(${i})">select</button></li>`).join("");
   document.querySelectorAll("#edlList li").forEach((li, i) =>
     li.style.borderColor = i === SEL ? "var(--acc)" : "var(--line)");
@@ -368,13 +418,228 @@ async function saveEdl() {
 }
 async function renderEdl() {
   await saveEdl();
-  $("#renderInfo").textContent = "rendering…";
+  $("#renderInfo").textContent = "rendering… (watch Pipeline for progress)";
   try {
-    const out = await api(`/api/edls/${EDL.id}/render`, {method:"POST"});
-    const name = EDL.music_path ? `${EDL.name}.mp4` : `${EDL.name}.mp4`;
-    $("#renderInfo").innerHTML = `rendered ${out.duration_s.toFixed(1)}s — <a href="/renders/${EDL.id}/${name}">open</a>`;
-    $("#preview").src = `/renders/${EDL.id}/${name}`;
+    const j = await api(`/api/edls/${EDL.id}/render`, {method:"POST"});
+    watch(j.id, (done) => {
+      const out = done.result;
+      if (done.state !== "done" || !out || !out.path) {
+        $("#renderInfo").textContent = "render failed: " + (done.error || "unknown error");
+        return;
+      }
+      // the server returns the real output path — the on-disk name is the
+      // EDL name, slugified, not the display name verbatim
+      const fname = out.path.split(/[\\/]/).pop();
+      const url = `/renders/${EDL.id}/${encodeURIComponent(fname)}`;
+      $("#renderInfo").innerHTML = `rendered ${(out.duration_s || 0).toFixed(1)}s — <a href="${url}">open</a>`;
+      $("#preview").src = url;
+    });
   } catch (e) { $("#renderInfo").textContent = "render failed: " + e.message; }
+}
+async function validateEdl() {
+  try {
+    const v = await api(`/api/edls/${EDL.id}/validate`);
+    const msgs = [
+      ...v.errors.map(e => "ERROR " + e.code + ": " + e.message),
+      ...v.warnings.map(w => "warn " + w.code + ": " + w.message)];
+    $("#renderInfo").textContent = msgs.length ? msgs.join(" | ") : "valid — no issues";
+  } catch (e) { $("#renderInfo").textContent = "validate failed: " + e.message; }
+}
+
+// ---- storyboard (Script · Storyboard · EDL) ----
+let SB = null, SB_SEGS = [];
+// Escape for HTML text/attribute context — everything interpolated into
+// innerHTML that came from a file name, VLM/LLM output, or user input goes
+// through this.
+const esc = (t) => String(t ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+const segOf = (id) => SB_SEGS.find(s => s.id === id);
+async function loadBoardView() {
+  SB_SEGS = await api("/api/segments");
+  await loadBoardList();
+}
+async function loadBoardList() {
+  const rows = await api("/api/storyboards");
+  $("#sbSelect").innerHTML = rows.map(b =>
+    `<option value="${b.id}">${esc(b.name)} (${b.id})</option>`).join("")
+    || '<option value="">no storyboards yet</option>';
+  if (rows.length) { $("#sbSelect").value = rows[0].id; await loadBoard(); }
+  else {
+    SB = null;
+    $("#sceneList").innerHTML = "";
+    $("#scriptPanel").innerHTML = '<span class="dim">Generate a storyboard above — it plans from the segment catalog.</span>';
+    $("#sbInfo").textContent = ""; $("#approveBtn").textContent = "";
+  }
+}
+async function loadBoard() {
+  const id = $("#sbSelect").value; if (!id) return;
+  SB = await api(`/api/storyboards/${id}`);
+  if (!SB.script) SB.script = {title:"", synopsis:"", beats:[]};
+  $("#sbVersions").innerHTML = SB.versions.map(v =>
+    `<option value="${v.version}">v${v.version} · ${v.origin}</option>`).join("");
+  drawBoard();
+}
+function drawBoard() {
+  if (!SB) return;
+  const d = SB.document;
+  $("#approveBtn").textContent = SB.status === "approved" ? "✓ approved" : "○ approve";
+  $("#approveBtn").style.color = SB.status === "approved" ? "var(--ok)" : "";
+  const dur = d.scenes.reduce((t,s) => t + (s.est_duration_s || 0), 0);
+  $("#sbInfo").textContent =
+    `${SB.status} · v${SB.current_version} · ${d.scenes.length} scenes · ${dur.toFixed(1)}s (target ${SB.target_duration_s}s)`;
+  $("#scriptPanel").innerHTML = `<h4>Script <span class="dim">(narration &amp; on-screen text — saving marks dependent scenes stale)</span></h4>
+    <div class="beatRow"><input type="text" value="${esc(SB.script.title)}" placeholder="title" style="flex:1" oninput="SB.script.title=this.value">
+    <button class="act" onclick="addBeat()">+ beat</button></div>
+    <div class="beatRow"><textarea placeholder="synopsis" oninput="SB.script.synopsis=this.value">${esc(SB.script.synopsis)}</textarea></div>
+    ${SB.script.beats.map((b,i) => `<div class="beatRow">
+      <input type="text" value="${esc(b.id)}" style="width:44px" title="beat id" onchange="SB.script.beats[${i}].id=this.value">
+      <input type="text" value="${esc(b.role)}" placeholder="role" style="width:90px" oninput="SB.script.beats[${i}].role=this.value">
+      <textarea placeholder="narration" oninput="SB.script.beats[${i}].narration=this.value">${esc(b.narration)}</textarea>
+      <input type="text" value="${esc(b.on_screen)}" placeholder="on-screen text" style="width:180px" oninput="SB.script.beats[${i}].on_screen=this.value">
+      <button class="act" onclick="SB.script.beats.splice(${i},1);drawBoard()">✕</button>
+    </div>`).join("")}
+    <button class="act" onclick="saveScript()">Save script</button> <span class="dim" id="scriptMsg"></span>`;
+  $("#sceneList").innerHTML = d.scenes.map((s,i) => {
+    const shot = s.shots[0];
+    const seg = shot ? segOf(shot.segment_id) : null;
+    return `<div class="sceneCard" id="scene_${esc(s.id)}">
+      ${seg && seg.clip_path ? `<video src="/clips/${shot.segment_id}" controls muted preload="metadata"></video>` : '<div class="dim" style="width:180px">no clip yet</div>'}
+      <div class="grow">
+        <div class="beatRow">
+          <b>${i+1}. ${esc(s.id)}</b>
+          <input type="text" value="${esc(s.title)}" placeholder="title" style="flex:1" oninput="updScene(${i},'title',this.value)">
+          <label class="dim"><input type="checkbox" ${s.locked?"checked":""} onchange="updScene(${i},'locked',this.checked)"> lock</label>
+          ${s.stale ? pill("stale","warn") : ""}
+          ${s.confidence != null ? pill("conf "+Number(s.confidence).toFixed(2), s.confidence < 0.4 ? "warn" : "ok") : ""}
+        </div>
+        <textarea rows="2" placeholder="description" oninput="updScene(${i},'description',this.value)">${esc(s.description)}</textarea>
+        ${(s.shots||[]).map((sh,j) => `<div class="shotRow">
+          <span class="dim">seg ${sh.segment_id}</span>
+          in <input type="number" step="0.1" value="${sh.source_start}" style="width:78px" onchange="updShot(${i},${j},'source_start',+this.value)">
+          out <input type="number" step="0.1" value="${sh.source_end}" style="width:78px" onchange="updShot(${i},${j},'source_end',+this.value)">
+          <select onchange="updShot(${i},${j},'transition_out',this.value)">
+            ${["cut","fade"].map(t=>`<option ${t===sh.transition_out?"selected":""}>${t}</option>`).join("")}
+          </select>
+        </div>`).join("")}
+        <div class="shotRow">
+          <select id="alt_${i}">
+            <option value="">swap with alternative…</option>
+            ${(s.alternates||[]).map(a => { const sa = segOf(a);
+              return `<option value="${a}">seg ${a}${sa ? " — " + esc((sa.description||"").slice(0,60)) : ""}</option>`; }).join("")}
+          </select>
+          <button class="act" onclick="swapAlternate(${i})">swap</button>
+          <button class="act" onclick="regenScene(${i})">✦ regen</button>
+          <button class="act" onclick="moveScene(${i},-1)">↑</button>
+          <button class="act" onclick="moveScene(${i},1)">↓</button>
+          <button class="act" onclick="removeScene(${i})">✕</button>
+        </div>
+        ${(s.open_issues&&s.open_issues.length) ? `<div class="dim">⚠ ${s.open_issues.map(esc).join(" · ")}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("") || '<div class="card dim">no scenes</div>';
+  const missing = d.missing_footage || [];
+  $("#missingPanel").classList.toggle("hidden", !missing.length);
+  $("#missingPanel").innerHTML = `<h4>Missing footage <span class="dim">(the story asked for shots the catalog lacks)</span></h4>` +
+    missing.map(m => `<div>• ${esc(m)}</div>`).join("");
+}
+function updScene(i, field, value) { SB.document.scenes[i][field] = value; }
+function updShot(i, j, field, value) { SB.document.scenes[i].shots[j][field] = value; }
+function addBeat() {
+  SB.script.beats.push({id:"b"+(SB.script.beats.length+1), role:"development",
+    narration:"", dialogue:"", on_screen:""});
+  drawBoard();
+}
+function moveScene(i, d) {
+  const scenes = SB.document.scenes;
+  if (i + d < 0 || i + d >= scenes.length) return;
+  [scenes[i], scenes[i+d]] = [scenes[i+d], scenes[i]];
+  drawBoard();
+}
+function removeScene(i) { SB.document.scenes.splice(i, 1); drawBoard(); }
+function swapAlternate(i) {
+  const alt = +$("#alt_"+i).value;
+  if (!alt) return;
+  const scene = SB.document.scenes[i];
+  const seg = segOf(alt);
+  if (!seg) return;
+  const old = scene.shots[0];
+  const span = old ? old.source_end - old.source_start : 4;
+  scene.shots = [{segment_id: alt, asset_id: seg.asset_id,
+    source_start: seg.start_s, source_end: Math.min(seg.start_s + span, seg.end_s),
+    transition_out: old ? old.transition_out : "cut"}];
+  scene.stale = false;
+  drawBoard();
+}
+async function saveBoard() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}`, {method:"PUT", body:{
+      scenes: SB.document.scenes, notes: SB.document.notes,
+      missing_footage: SB.document.missing_footage}});
+    $("#sbMsg").textContent = `saved v${r.version}`;
+    await loadBoard();
+  } catch (e) { $("#sbMsg").textContent = "save failed: " + e.message; }
+}
+async function saveScript() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}/script`, {method:"PUT", body:{
+      title: SB.script.title, synopsis: SB.script.synopsis, beats: SB.script.beats}});
+    $("#scriptMsg").textContent = r.stale_scenes.length
+      ? `saved — stale scenes: ${r.stale_scenes.join(", ")}` : "saved";
+    await loadBoard();
+  } catch (e) { $("#scriptMsg").textContent = "failed: " + e.message; }
+}
+async function regenScene(i) {
+  // scene ids are free-form (API/LLM-settable) — resolve by index, never by
+  // splicing them into an inline JS string
+  const sceneId = SB.document.scenes[i].id;
+  $("#sbMsg").textContent = "regenerating " + sceneId + "…";
+  try {
+    const j = await api(`/api/storyboards/${SB.id}/regenerate`,
+      {method:"POST", body:{scene_id: sceneId}});
+    watch(j.id, () => loadBoard());
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
+}
+async function regenAll() {
+  $("#sbMsg").textContent = "regenerating whole storyboard…";
+  try {
+    const j = await api(`/api/storyboards/${SB.id}/regenerate`, {method:"POST", body:{}});
+    watch(j.id, () => loadBoard());
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
+}
+async function toggleApprove() {
+  await api(`/api/storyboards/${SB.id}/approve?approve=${SB.status !== "approved"}`, {method:"POST"});
+  await loadBoard();
+}
+async function restoreVersion() {
+  const v = +$("#sbVersions").value;
+  if (!v) return;
+  const r = await api(`/api/storyboards/${SB.id}/restore`, {method:"POST", body:{version: v}});
+  $("#sbMsg").textContent = `restored v${r.restored_from} as v${r.version}`;
+  await loadBoard();
+}
+async function compileBoard() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}/compile`, {method:"POST"});
+    $("#sbMsg").innerHTML = `compiled <b>${r.edl_id}</b>: ${r.items} items, ${r.duration_s.toFixed(1)}s` +
+      (r.warnings.length ? ` — ${r.warnings.length} warning(s) (see EDL → Validate)` : "");
+    loadEdlList();
+  } catch (e) { $("#sbMsg").textContent = "compile failed: " + e.message; }
+}
+async function generateBoard() {
+  const objective = $("#sbObjective").value.trim();
+  if (!objective) { $("#sbMsg").textContent = "give the edit an objective first"; return; }
+  $("#sbMsg").textContent = "planning… (watch Pipeline for progress)";
+  try {
+    const j = await api("/api/storyboards/generate", {method:"POST", body:{
+      objective, target_duration_s: +$("#sbDuration").value || 30,
+      style: $("#sbStyle").value, name: "storyboard"}});
+    watch(j.id, (done) => {
+      if (done.state !== "done") { $("#sbMsg").textContent = "failed: " + (done.error || "unknown"); return; }
+      const out = done.result;
+      $("#sbMsg").innerHTML = `planned <b>${out.storyboard_id}</b> via ${out.origin} — ${out.scenes} scenes` +
+        (out.missing_footage && out.missing_footage.length ? " · has missing footage" : "");
+      loadBoardView();
+    });
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
 }
 
 loadSetup(); loadAssets(); loadSegments();

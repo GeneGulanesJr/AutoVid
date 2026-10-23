@@ -22,6 +22,7 @@ clip / slow down / speed up) — it never estimates timing itself.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import sqlite3
@@ -64,7 +65,8 @@ def derive_structure(music: MusicAnalysis) -> list[tuple[str, object]]:
 
 
 def _beats_between(music: MusicAnalysis, start: float, end: float) -> list[float]:
-    return [b for b in music.beats if start - 1e-6 <= b < end]
+    beats = music.beats  # ascending
+    return beats[bisect.bisect_left(beats, start - 1e-6):bisect.bisect_left(beats, end)]
 
 
 def _slots(
@@ -121,16 +123,14 @@ def _pick_clip(
     tags) → reuse, and only then a too-short candidate trimmed to fit.
     ``None`` only when the pool is empty.
     """
-    eligible = [c for c in candidates if c.duration_s >= slot_len]
+    eligible = sorted(
+        (c for c in candidates if c.duration_s >= slot_len),
+        key=(lambda c: (-c.duration_s, -c.score, c.start_s)) if prefer == "duration"
+        else (lambda c: (-c.score, c.start_s)),
+    )
     fresh = [c for c in eligible if c.segment_id not in used]
 
-    def rank(pool: list[Candidate]) -> list[Candidate]:
-        if prefer == "duration":
-            return sorted(pool, key=lambda c: (-c.duration_s, -c.score, c.start_s))
-        return sorted(pool, key=lambda c: (-c.score, c.start_s))
-
-    def pick(pool: list[Candidate], *, distinct: bool) -> Candidate | None:
-        ranked = rank(pool)
+    def pick(ranked: list[Candidate], *, distinct: bool) -> Candidate | None:
         if distinct and prev_tags:
             for c in ranked:
                 overlap = len(c.tags & prev_tags) / max(len(c.tags | prev_tags), 1)
@@ -138,18 +138,14 @@ def _pick_clip(
                     return c
         return ranked[0] if ranked else None
 
-    for pool, distinct in (
-        (fresh, True),
-        (fresh, False),
-        (eligible, True),
-        (eligible, False),
-    ):
+    # Relaxation order: fresh + fresh-tags → fresh (any tags) → reuse.
+    for pool, distinct in ((fresh, True), (fresh, False),
+                           (eligible, True), (eligible, False)):
         pick_result = pick(pool, distinct=distinct)
         if pick_result is not None:
             return pick_result
     # last resort: the longest anything, trimmed to the slot
-    all_sorted = sorted(candidates, key=lambda c: -c.duration_s)
-    return all_sorted[0] if all_sorted else None
+    return max(candidates, key=lambda c: c.duration_s, default=None)
 
 
 def plan_music_video(
@@ -191,7 +187,9 @@ def plan_music_video(
             # measured-pacing plan rather than aborting the edit.
             fallback = "energetic" if sec.energy_mean >= median_energy else "calm"
             try:
-                audio_b64 = section_audio_b64(music.path, sec.start, sec.end)
+                audio_b64 = section_audio_b64(
+                    music.path, sec.start, sec.end, waveform=music.waveform
+                )
                 mood = decisions.decide_music_mood(
                     json.dumps({
                         "role": role,
@@ -218,6 +216,7 @@ def plan_music_video(
     for plan in section_plans:
         prev_tags: frozenset[str] = frozenset()
         prefer = "duration" if plan["mood"] == "calm" else "score"
+        section_first = len(items)  # this section's items are items[section_first:]
         for slot_start, slot_end in plan["slots"]:
             slot_len = slot_end - slot_start
             clip = _pick_clip(candidates, used, slot_len, prev_tags, prefer=prefer)
@@ -227,9 +226,13 @@ def plan_music_video(
             src_start = clip.start_s
             src_end = min(clip.start_s + slot_len, clip.end_s)
             slot_len = src_end - src_start  # a trimmed last resort may be shorter
+            # first beat within half a beat of the timeline (beats ascending)
+            half = 60.0 / music.tempo_bpm / 2 + 1e-6
+            i = bisect.bisect_left(music.beats, timeline)
             beat_idx = next(
-                (i for i, b in enumerate(music.beats)
-                 if abs(b - timeline) <= (60.0 / music.tempo_bpm / 2 + 1e-6)),
+                (j for j in (i - 1, i)
+                 if 0 <= j < len(music.beats)
+                 and abs(music.beats[j] - timeline) <= half),
                 None,
             )
             items.append(edl_mod.EDLItem(
@@ -245,7 +248,8 @@ def plan_music_video(
             prev_tags = clip.tags
             timeline += slot_len
 
-        if decisions is not None and items:
+        section_items = items[section_first:]
+        if decisions is not None and section_items:
             review = decisions.decide_sequence_review(
                 context=json.dumps({
                     "role": plan["role"],
@@ -253,17 +257,19 @@ def plan_music_video(
                     "section_start": plan["start"],
                     "section_end": plan["end"],
                     "beats_per_cut": plan["beats_per_cut"],
+                    # Exactly the items this section produced — plan["start"]
+                    # is a music-track position and must not be compared with
+                    # the items' output-timeline positions.
                     "clips": [
                         {"clip_id": i.clip_id, "tags": [], "slot_s":
                          round((i.timeline_end or 0) - (i.timeline_start or 0), 2)}
-                        for i in items if i.timeline_start is not None
-                        and i.timeline_start >= plan["start"] - 0.01
+                        for i in section_items
                     ],
                 }),
             )
-            if review.action == "replace_clip" and len(items) >= 2:
+            if review.action == "replace_clip" and len(section_items) >= 2:
                 # swap the section's middle item for the best unused candidate
-                mid = len(items) - max(1, len(items) // 2)
+                mid = section_first + max(1, len(section_items) // 2)
                 old = items[mid]
                 replacement = _pick_clip(
                     candidates, used | {old.clip_id},

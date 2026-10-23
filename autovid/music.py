@@ -44,6 +44,9 @@ class MusicAnalysis:
     downbeats: list[float]
     sections: list[MusicSection]
     analyzer: str = field(default="librosa")
+    # Decoded mono waveform at SR, kept so per-section mood calls slice memory
+    # instead of re-decoding the file with a fresh ffmpeg process each time.
+    waveform: np.ndarray | None = field(default=None, compare=False, repr=False)
 
 
 def _decode_mono(path: str | Path) -> tuple[np.ndarray, int]:
@@ -52,7 +55,7 @@ def _decode_mono(path: str | Path) -> tuple[np.ndarray, int]:
         wav_path = Path(tmp.name)
     try:
         cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "error",
             "-i", str(path),
             "-ac", "1", "-ar", str(SR),
             "-f", "wav", str(wav_path),
@@ -116,22 +119,43 @@ def section_audio_b64(
     *,
     max_s: float = 28.0,
     sample_rate: int = 16000,
+    waveform: np.ndarray | None = None,
 ) -> str:
-    """Decode [start, end) of an audio file to base64 16 kHz mono int16 PCM.
+    """[start, end) of an audio file as base64 16 kHz mono int16 PCM.
 
     Sections longer than ``max_s`` contribute their middle ``max_s`` window
     (the checkpoint cuts audio at 30 s; 28 s leaves transport headroom).
     Feeds the decision layer's audio mood tool.
+
+    ``waveform`` (mono float32 at SR, as carried by :class:`MusicAnalysis`)
+    serves the section from memory; without it the span is decoded from the
+    file with a fresh ffmpeg process.
     """
     if end - start > max_s:
         mid = (start + end) / 2
         start, end = mid - max_s / 2, mid + max_s / 2
     start = max(start, 0.0)
+
+    if waveform is not None:
+        import base64
+
+        seg = np.asarray(waveform[int(start * SR):int(end * SR)], dtype=np.float32)
+        if len(seg) == 0:
+            raise AutoVidError(f"section audio decoded to zero samples: {path}")
+        if sample_rate != SR:
+            n_out = max(1, int(round(len(seg) * sample_rate / SR)))
+            seg = np.interp(
+                np.linspace(0.0, len(seg) - 1.0, n_out), np.arange(len(seg), dtype=np.float64), seg
+            )
+        pcm = np.clip(seg, -1.0, 1.0)
+        pcm = (pcm * 32767.0).astype(np.int16)
+        return base64.b64encode(pcm.tobytes()).decode("ascii")
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = Path(tmp.name)
     try:
         cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "error",
             "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
             "-i", str(path),
             "-ac", "1", "-ar", str(sample_rate),
@@ -215,4 +239,5 @@ def analyze_music(path: str | Path) -> MusicAnalysis:
         downbeats=downbeats,
         sections=sections,
         analyzer=f"librosa {_lib.__version__}",
+        waveform=y,
     )

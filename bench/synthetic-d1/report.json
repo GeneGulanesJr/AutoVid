@@ -1,0 +1,71 @@
+{
+  "name": "synthetic-d1",
+  "assets": [
+    "a_339f246e4864a670",
+    "a_53509738aea427d9",
+    "a_6e7d1fee38a055d5",
+    "a_2b66d8c047868f99"
+  ],
+  "boundary_tolerance_s": 0.5,
+  "decision_mode": "d1",
+  "baseline": {
+    "mode": "baseline",
+    "windows": 13,
+    "vlm_frames": 61,
+    "vlm_calls": 13,
+    "vlm_outages": 13,
+    "dense_frames": 0,
+    "flagged": 13,
+    "accepted_segments": 0,
+    "boundaries": {
+      "count": 6,
+      "timestamps": [
+        8.0,
+        10.0,
+        12.0,
+        16.0,
+        24.0,
+        36.0
+      ],
+      "prf": {
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      }
+    },
+    "elapsed_s": 6.23
+  },
+  "guided": {
+    "mode": "guided",
+    "windows": 13,
+    "vlm_frames": 61,
+    "vlm_calls": 13,
+    "vlm_outages": 13,
+    "dense_frames": 0,
+    "flagged": 13,
+    "accepted_segments": 0,
+    "boundaries": {
+      "count": 6,
+      "timestamps": [
+        8.0,
+        10.0,
+        12.0,
+        16.0,
+        24.0,
+        36.0
+      ],
+      "prf": {
+        "tp": 6,
+        "fp": 0,
+        "fn": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      }
+    },
+    "elapsed_s": 179.49
+  }
+}

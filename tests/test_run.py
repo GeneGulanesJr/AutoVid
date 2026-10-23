@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from typer.testing import CliRunner
 
+import autovid.analyze as analyze_mod
 import autovid.cli as cli
 import autovid.sampling as sampling
 import autovid.transcribe as transcribe
@@ -45,7 +46,7 @@ def env(tmp_path, monkeypatch):
         return 1
 
     monkeypatch.setattr(transcribe, "transcribe_asset", fake_transcribe)
-    monkeypatch.setattr(cli, "analyze_asset", lambda c, s, aid, **k: (calls["analyze"].append(aid), set_status(aid, "analyzed")))
+    monkeypatch.setattr(analyze_mod, "analyze_asset", lambda c, s, aid, **k: (calls["analyze"].append(aid), set_status(aid, "analyzed")))
     monkeypatch.setattr(VLMClient, "ping", lambda self: calls["ping"].append("ping"))
     yield folder, cat, calls
     get_settings.cache_clear()

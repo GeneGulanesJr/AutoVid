@@ -341,8 +341,14 @@ def test_cold_start_without_vlm_rescues_via_review(settings: Settings, tmp_path:
     out = render_edl(conn, coarse, board)
     assert out.exists()
     assert probe(out).duration_s > 1.0
-    # lazily extracted per-item clips are staged for the render, then cleaned up
-    assert list(out.parent.glob("item_*.mp4")) == []
+    # per-item clips staged by provenance stay for the next re-render to reuse
+    staged_first = sorted(out.parent.glob("item_*.mp4"))
+    assert staged_first, "expected lazily extracted item clips to be cached"
+
+    out2 = render_edl(conn, coarse, board)
+    assert out2.exists()
+    # same staged set after the re-render — nothing re-extracted, nothing stray
+    assert sorted(out2.parent.glob("item_*.mp4")) == staged_first
 
 
 def test_speech_driven_assets_skip_the_visual_highlight_gate(settings, tmp_path, monkeypatch):

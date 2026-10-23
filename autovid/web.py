@@ -1,9 +1,11 @@
 """Minimal web review UI: catalog, review queue, EDL editor, render.
 
 Binds to localhost only; no auth (like DecisionMCP's server — local tooling).
-The UI is a single static page + JSON API; EDL edits are full-list replaces
-(reorder/remove/trim happen client-side, then save), and human review
-decisions land straight in the segments table.
+A middleware rejects any request whose ``Host`` header is not localhost, so a
+browser tab cannot reach the API via DNS rebinding. The UI is a single static
+page + JSON API; EDL edits are full-list replaces (reorder/remove/trim happen
+client-side, then save), and human review decisions land straight in the
+segments table.
 
 The app surface also covers: settings (edits ``.env`` in place — the source
 of truth pydantic-settings reads; secrets never round-trip), first-run setup
@@ -19,17 +21,20 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from . import agent as agent_mod
 from . import db
+from . import storyboard_doc as doc_mod
 from .analyze import analyze_asset
 from .config import Settings, get_settings
 from .decisions import DecisionClient
-from .edl import EDL, EDLItem, load as load_edl, save as save_edl
+from .edl import EDL, EDLItem, load as load_edl, save as save_edl, validate_edl
 from .errors import AutoVidError
 from .render import render_edl
+from .storyboard_doc import ScriptBeat, ScriptDocument, StoryboardScene
 from .vlm import VLMClient
 
 logger = logging.getLogger(__name__)
@@ -80,6 +85,35 @@ class MusicPlanParams(BaseModel):
     render: bool = True
 
 
+class StoryboardGenerateParams(BaseModel):
+    objective: str
+    target_duration_s: float = 30.0
+    style: str = "cinematic"
+    name: str = "storyboard"
+
+
+class StoryboardUpdate(BaseModel):
+    """Full-document replace of the current storyboard's scenes."""
+
+    scenes: list[StoryboardScene]
+    notes: str | None = None
+    missing_footage: list[str] | None = None
+
+
+class ScriptUpdate(BaseModel):
+    title: str | None = None
+    synopsis: str | None = None
+    beats: list[ScriptBeat]
+
+
+class RegenerateParams(BaseModel):
+    scene_id: str | None = None  # None = regenerate the whole board
+
+
+class RestoreParams(BaseModel):
+    version: int
+
+
 class Job:
     """One background pipeline run, polled by the browser."""
 
@@ -93,19 +127,22 @@ class Job:
         self.current = ""
         self.log: list[str] = []
         self.error: str | None = None
+        self.result: dict = {}  # endpoint-specific payload, set when done
         self.started = time.time()
 
     def view(self) -> dict:
         return {
             "id": self.id, "stage": self.stage, "state": self.state,
             "done": self.done, "total": self.total, "current": self.current,
-            "log": self.log[-8:], "error": self.error,
+            "log": self.log[-8:], "error": self.error, "result": self.result,
         }
 
 
 class JobRunner:
     """In-process background jobs. One job at a time — the pipeline is
     inherently sequential per catalog, and stages write the same tables."""
+
+    MAX_JOBS = 50  # long-lived desktop process: don't grow the history forever
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
@@ -119,6 +156,11 @@ class JobRunner:
                 raise HTTPException(409, f"job {running[0].id} ({running[0].stage}) "
                                          "is still running — wait for it first")
             self._jobs[job.id] = job
+            if len(self._jobs) > self.MAX_JOBS:
+                by_age = sorted(self._jobs.values(), key=lambda j: j.started)
+                for old in by_age[: len(self._jobs) - self.MAX_JOBS]:
+                    if old.state != "running":
+                        self._jobs.pop(old.id, None)
         thread = threading.Thread(target=self._wrap, args=(job, target), daemon=True)
         thread.start()
         return job
@@ -139,21 +181,61 @@ class JobRunner:
         return job
 
     def list(self) -> list[dict]:
-        return [j.view() for j in sorted(self._jobs.values(),
-                                         key=lambda j: -j.started)]
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: -j.started)
+        return [j.view() for j in jobs]
+
+
+# The API is unauthenticated; anything answering a non-loopback Host header is
+# reachable by DNS rebinding from a random web page in the user's browser.
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="AutoVid review", docs_url=None, redoc_url=None)
+
+    @app.middleware("http")
+    async def localhost_only(request: Request, call_next):
+        header = request.headers.get("host") or ""
+        if header.startswith("["):  # bracketed IPv6, e.g. [::1]:8766
+            host = header[1:header.index("]") if "]" in header else len(header)]
+        elif header.count(":") == 1:
+            host = header.rsplit(":", 1)[0]
+        else:
+            host = header
+        if host.lower() not in _ALLOWED_HOSTS:
+            return JSONResponse({"detail": "localhost only"}, status_code=403)
+        return await call_next(request)
+
     holder = {"settings": settings}  # refreshed after settings saves
     runner = JobRunner()
 
     def current_settings() -> Settings:
         return holder["settings"]
 
+    conn_cache = threading.local()
+
     def conn():
-        return db.connect(holder["settings"].db_path)
+        """One cached connection per (thread, database path).
+
+        Per-thread, not global: sqlite3 connections must not interleave
+        statements from concurrent request threads — a shared connection
+        would merge separate requests' writes into one implicit transaction.
+        Cached because connect+pragmas+init_db per request was pure churn;
+        bounded by the threadpool size. Job threads open (and close) their
+        own connections.
+        """
+        s = holder["settings"]
+        key = str(Path(s.db_path).resolve())
+        per_path = getattr(conn_cache, "per_path", None)
+        if per_path is None:
+            per_path = conn_cache.per_path = {}
+        c = per_path.get(key)
+        if c is None:
+            c = db.connect(s.db_path)
+            per_path[key] = c
+        return c
 
     @app.get("/")
     def index() -> FileResponse:
@@ -183,7 +265,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get("/api/segments")
-    def segments(asset_id: str | None = None, q: str | None = None) -> list[dict]:
+    def segments(
+        asset_id: str | None = None, q: str | None = None,
+        status: str | None = None, limit: int = 1000,
+    ) -> list[dict]:
         c = conn()
         sql = (
             "SELECT s.*, a.original_name FROM segments s JOIN assets a ON a.id = s.asset_id "
@@ -197,7 +282,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pattern = f"%{q.lower()}%"
             sql += " AND (lower(s.description) LIKE ? OR lower(s.tags_json) LIKE ?)"
             args += [pattern, pattern]
-        sql += " ORDER BY s.highlight_score DESC"
+        if status:
+            sql += " AND s.review_status = ?"
+            args.append(status)
+        sql += " ORDER BY s.highlight_score DESC LIMIT ?"
+        args.append(max(int(limit), 1))
         return [dict(r) for r in c.execute(sql, args).fetchall()]
 
     @app.post("/api/segments/{segment_id}/review")
@@ -270,10 +359,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         c = conn()
         try:
             board = load_edl(c, edl_id)
-            out = render_edl(c, current_settings(), board)
         except AutoVidError as e:
-            raise HTTPException(409, str(e))
-        return {"edl_id": edl_id, "path": str(out), "duration_s": board.duration_s}
+            raise HTTPException(404, str(e))
+        validation = validate_edl(c, board)
+        if not validation.ok:
+            raise HTTPException(400, "; ".join(e.message for e in validation.errors))
+
+        # Renders take minutes (dozens of ffmpeg spawns) — run as a job so the
+        # request returns at once and the browser polls progress. Also keeps
+        # the one-job-at-a-time guard: a render must not interleave with a
+        # pipeline stage writing the same tables.
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            try:
+                board = load_edl(c, edl_id)
+                job.current = board.name
+                out = render_edl(c, s, board)
+                job.result = {"edl_id": edl_id, "path": str(out),
+                              "duration_s": board.duration_s}
+                job.log.append(f"rendered {out.name}")
+            finally:
+                c.close()
+
+        return runner.start("render", {"edl_id": edl_id}, target).view()
 
     @app.get("/renders/{edl_id}/{name}")
     def rendered(edl_id: str, name: str) -> FileResponse:
@@ -282,6 +391,180 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not path.is_relative_to((data_dir / "renders").resolve()) or not path.exists():
             raise HTTPException(404, "render not found")
         return FileResponse(path, media_type="video/mp4", filename=name)
+
+    @app.get("/api/edls/{edl_id}/validate")
+    def edl_validation(edl_id: str) -> dict:
+        try:
+            board = load_edl(conn(), edl_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        return validate_edl(conn(), board).model_dump()
+
+    # -- storyboards: Script · Storyboard · EDL ------------------------------
+
+    @app.get("/api/storyboards")
+    def storyboards_list() -> list[dict]:
+        return [dict(r) for r in doc_mod.list_boards(conn())]
+
+    @app.post("/api/storyboards/generate")
+    def storyboards_generate(params: StoryboardGenerateParams) -> dict:
+        # The agent is one or more LLM round trips (~30s each) — a job, like
+        # render/music. Falls back to the deterministic planner (recorded in
+        # the result origin) when no key is set or the draft fails the
+        # catalog gate twice.
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            try:
+                job.current = "planning storyboard"
+                board_id, origin = agent_mod.generate_with_fallback(
+                    c, s, objective=params.objective,
+                    target_duration_s=params.target_duration_s,
+                    style=params.style, name=params.name,
+                )
+                row = doc_mod.get_board(c, board_id)
+                document, version = doc_mod.load_document(c, board_id)
+                job.result = {
+                    "storyboard_id": board_id, "origin": origin, "version": version,
+                    "name": row["name"], "scenes": len(document.scenes),
+                    "duration_s": round(document.duration_s, 2),
+                    "missing_footage": document.missing_footage,
+                }
+                job.log.append(
+                    f"storyboard {board_id} via {origin}: "
+                    f"{len(document.scenes)} scenes, {document.duration_s:.1f}s")
+            finally:
+                c.close()
+
+        return runner.start("storyboard-generate", params.model_dump(), target).view()
+
+    @app.get("/api/storyboards/{storyboard_id}")
+    def storyboards_get(storyboard_id: str) -> dict:
+        c = conn()
+        try:
+            row = doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        document, version = doc_mod.load_document(c, storyboard_id)
+        script = doc_mod.load_script(c, storyboard_id)
+        return {
+            **dict(row), "current_version": version,
+            "document": document.model_dump(),
+            "script": script.model_dump() if script else None,
+            "versions": [dict(v) for v in doc_mod.list_versions(c, storyboard_id)],
+        }
+
+    @app.put("/api/storyboards/{storyboard_id}")
+    def storyboards_put(storyboard_id: str, update: StoryboardUpdate) -> dict:
+        c = conn()
+        try:
+            doc, _ = doc_mod.load_document(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        document = doc.model_copy(update={
+            "scenes": update.scenes,
+            "notes": update.notes if update.notes is not None else doc.notes,
+            "missing_footage": (update.missing_footage if update.missing_footage is not None
+                                else doc.missing_footage),
+        })
+        script = doc_mod.load_script(c, storyboard_id) \
+            or ScriptDocument(storyboard_id=storyboard_id)
+        problems = agent_mod.validate_document(c, document, script)
+        if problems:
+            raise HTTPException(400, "; ".join(problems))
+        version = doc_mod.save_document(c, storyboard_id, document, origin="user_edit")
+        return {"storyboard_id": storyboard_id, "version": version}
+
+    @app.put("/api/storyboards/{storyboard_id}/script")
+    def script_put(storyboard_id: str, update: ScriptUpdate) -> dict:
+        c = conn()
+        try:
+            doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        script = doc_mod.load_script(c, storyboard_id) \
+            or ScriptDocument(storyboard_id=storyboard_id)
+        if update.title is not None:
+            script.title = update.title
+        if update.synopsis is not None:
+            script.synopsis = update.synopsis
+        script.beats = update.beats
+        doc_mod.save_script(c, script)  # marks dependent scenes stale + bumps version
+        document, version = doc_mod.load_document(c, storyboard_id)
+        return {
+            "storyboard_id": storyboard_id, "version": version,
+            "stale_scenes": [s.id for s in document.scenes if s.stale],
+        }
+
+    @app.post("/api/storyboards/{storyboard_id}/regenerate")
+    def storyboards_regenerate(storyboard_id: str, params: RegenerateParams) -> dict:
+        try:
+            doc_mod.get_board(conn(), storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        if not current_settings().vlm_api_key:
+            raise HTTPException(
+                409, "no VLM key configured — regeneration needs the agent; "
+                     "edit scenes manually or re-run generate (planner fallback)")
+
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            sb_agent = agent_mod.StoryboardAgent(s)
+            try:
+                job.current = "regenerating " + (params.scene_id or "whole storyboard")
+                version = sb_agent.regenerate(c, storyboard_id, scene_id=params.scene_id)
+                job.result = {"storyboard_id": storyboard_id, "version": version}
+                job.log.append(f"regenerated {params.scene_id or 'all'} → v{version}")
+            finally:
+                sb_agent.client.close()
+                c.close()
+
+        return runner.start(
+            "storyboard-regenerate",
+            {"storyboard_id": storyboard_id, **params.model_dump()}, target,
+        ).view()
+
+    @app.post("/api/storyboards/{storyboard_id}/compile")
+    def storyboards_compile(storyboard_id: str) -> dict:
+        c = conn()
+        try:
+            doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        try:
+            board = doc_mod.compile_to_edl(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(400, str(e))
+        validation = validate_edl(c, board)
+        return {
+            "edl_id": board.id, "duration_s": board.duration_s,
+            "items": len(board.items),
+            "warnings": [w.model_dump() for w in validation.warnings],
+        }
+
+    @app.post("/api/storyboards/{storyboard_id}/approve")
+    def storyboards_approve(storyboard_id: str, approve: bool = True) -> dict:
+        try:
+            doc_mod.set_status(conn(), storyboard_id,
+                               "approved" if approve else "draft")
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        return {"storyboard_id": storyboard_id,
+                "status": "approved" if approve else "draft"}
+
+    @app.post("/api/storyboards/{storyboard_id}/restore")
+    def storyboards_restore(storyboard_id: str, params: RestoreParams) -> dict:
+        c = conn()
+        try:
+            document, restored_from = doc_mod.load_document(c, storyboard_id, params.version)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        version = doc_mod.save_document(
+            c, storyboard_id, document, origin="restore",
+            note=f"restored from v{restored_from}")
+        return {"storyboard_id": storyboard_id, "version": version,
+                "restored_from": restored_from}
 
     # -- settings (edits .env in place) --------------------------------------
 
@@ -407,16 +690,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def target(job: Job) -> None:
             s = current_settings()
             c = db.connect(s.db_path)
-            from .ingest import ingest_folder
+            try:
+                from .ingest import ingest_folder
 
-            report = ingest_folder(
-                c, s, folder, recursive=params.recursive,
-                progress=lambda p, i, n: (
-                    setattr(job, "done", i), setattr(job, "total", n),
-                    setattr(job, "current", Path(p).name)),
-            )
-            job.log.append(f"added {len(report.added)}, duplicates {len(report.duplicates)}, "
-                           f"unchanged {len(report.skipped)}, failed {len(report.failed)}")
+                report = ingest_folder(
+                    c, s, folder, recursive=params.recursive,
+                    progress=lambda p, i, n: (
+                        setattr(job, "done", i), setattr(job, "total", n),
+                        setattr(job, "current", Path(p).name)),
+                )
+                job.log.append(f"added {len(report.added)}, duplicates {len(report.duplicates)}, "
+                               f"unchanged {len(report.skipped)}, failed {len(report.failed)}")
+            finally:
+                c.close()
 
         return runner.start("ingest", params.model_dump(), target).view()
 
@@ -442,25 +728,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 targets = [asset_id] if asset_id else [
                     r["id"] for r in pending_assets(c, status_for[stage])]
-            if stage == "analyze" and vlm.configured:
-                vlm.ping()  # a bad key / model / parameter stops the job here, with the server's reason
             job.total = len(targets)
-            for aid in targets:
-                job.current = aid
-                if stage == "sample":
-                    sampling.sample_asset(c, s, aid)
-                elif stage == "analyze":
-                    analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
-                elif stage == "cut":
-                    cut_asset(c, s, aid, decisions=decisions)
-                elif stage == "transcribe":
-                    job.log.append(f"{aid}: {transcribe_asset(c, s, aid, model=whisper)} utterances")
-                else:
-                    from .organize import organize_asset
+            try:
+                if stage == "analyze" and vlm.configured:
+                    vlm.ping()  # a bad key / model / parameter stops the job here, with the server's reason
+                for aid in targets:
+                    job.current = aid
+                    if stage == "sample":
+                        sample_asset(c, s, aid)
+                    elif stage == "analyze":
+                        analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
+                    elif stage == "cut":
+                        cut_asset(c, s, aid, decisions=decisions)
+                    elif stage == "transcribe":
+                        job.log.append(f"{aid}: {transcribe_asset(c, s, aid, model=whisper)} utterances")
+                    else:
+                        from .organize import organize_asset
 
-                    organize_asset(c, s, aid)
-                job.done += 1
-                job.log.append(f"{aid}: done")
+                        organize_asset(c, s, aid)
+                    job.done += 1
+                    job.log.append(f"{aid}: done")
+            finally:
+                vlm.close()
+                decisions.close()
+                c.close()
 
         return target
 
@@ -483,31 +774,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/music/plan")
     def music_plan(params: MusicPlanParams) -> dict:
-        s = current_settings()
-        c = conn()
         music_file = Path(params.music_path)
         if not music_file.exists():
             raise HTTPException(400, f"music file not found: {params.music_path}")
-        from .music import analyze_music
-        from .planner import plan_music_video
 
-        try:
-            analysis = analyze_music(music_file)
-            decisions = DecisionClient(s, c)
-            board = plan_music_video(
-                c, s, analysis, objective=params.objective, mode=params.mode,
-                style=params.style, name=params.name, decisions=decisions,
-            )
-        except (AutoVidError, ValueError) as e:
-            raise HTTPException(409, str(e))
-        out = {"edl_id": board.id, "items": len(board.items),
-               "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
-        if params.render:
+        # Librosa analysis + per-section mood calls + render take minutes —
+        # job, not request (same reasoning as the render endpoint).
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            from .music import analyze_music
+            from .planner import plan_music_video
+
             try:
-                out["render_path"] = str(render_edl(c, s, board))
-            except AutoVidError as e:
-                out["render_error"] = str(e)
-        return out
+                job.current = "analyzing music"
+                analysis = analyze_music(music_file)
+                decisions = DecisionClient(s, c)
+                try:
+                    board = plan_music_video(
+                        c, s, analysis, objective=params.objective, mode=params.mode,
+                        style=params.style, name=params.name, decisions=decisions,
+                    )
+                finally:
+                    decisions.close()
+                out = {"edl_id": board.id, "items": len(board.items),
+                       "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
+                job.log.append(f"planned {len(board.items)} cuts @ "
+                               f"{analysis.tempo_bpm:.0f} BPM")
+                if params.render:
+                    job.current = "rendering"
+                    try:
+                        out["render_path"] = str(render_edl(c, s, board))
+                    except AutoVidError as e:
+                        out["render_error"] = str(e)
+                job.result = out
+            finally:
+                c.close()
+
+        return runner.start("music-plan", params.model_dump(), target).view()
 
     return app
 
