@@ -17,26 +17,34 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 @lru_cache(maxsize=None)
 def _bin(name: str, explicit_dir: str | None) -> str:
-    candidates: list[Path] = []
+    # Order must match the docstring: explicit dir wins over whatever happens
+    # to be on PATH, vendored build is the last resort.
     if explicit_dir:
-        candidates.append(Path(explicit_dir))
+        found = _exe_in(Path(explicit_dir), name)
+        if found:
+            return found
     which = shutil.which(name)
     if which:
         return which
-    vendored = sorted(REPO_ROOT.glob(".tools/ffmpeg*/bin"))
-    candidates.extend(vendored)
-    for directory in candidates:
-        exe = directory / f"{name}.exe"
-        if exe.exists():  # windows
-            return str(exe)
-        posix = directory / name
-        if posix.exists():
-            return str(posix)
+    for vendored in sorted(REPO_ROOT.glob(".tools/ffmpeg*/bin")):
+        found = _exe_in(vendored, name)
+        if found:
+            return found
     raise AutoVidError(
         f"{name} not found. Set AUTOVID_FFMPEG_DIR to a folder containing "
         f"{name}.exe, install ffmpeg on PATH, or keep the vendored "
         f".tools/ffmpeg* build in the repo."
     )
+
+
+def _exe_in(directory: Path, name: str) -> str | None:
+    exe = directory / f"{name}.exe"
+    if exe.exists():  # windows
+        return str(exe)
+    posix = directory / name
+    if posix.exists():
+        return str(posix)
+    return None
 
 
 def ffmpeg_path() -> str:
