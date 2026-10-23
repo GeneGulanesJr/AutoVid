@@ -17,8 +17,7 @@ from PIL import Image
 from . import db
 from .config import Settings
 from .errors import AutoVidError
-from .ffmpeg_io.frames import extract_periodic_frames
-from .ffmpeg_io.scenes import detect_scene_changes
+from .ffmpeg_io.frames import extract_grid_and_scene_changes
 from .ingest import get_asset
 
 logger = logging.getLogger(__name__)
@@ -60,7 +59,15 @@ def sample_asset(
         if not source.exists():
             raise AutoVidError(f"Source file missing: {source}")
 
-        changes = detect_scene_changes(source, threshold=settings.scene_threshold)
+        # One decode serves both the grid frames and the scene-change
+        # detections (previously two separate full-file decode passes).
+        grid_dir = settings.assets_dir / asset_id / "grid"
+        grid, changes = extract_grid_and_scene_changes(
+            source, grid_dir,
+            interval_s=settings.grid_interval_s, width=GRID_WIDTH, prefix="grid",
+            scene_threshold=settings.scene_threshold,
+        )
+
         conn.execute("DELETE FROM scenes WHERE asset_id = ?", (asset_id,))
         conn.executemany(
             """INSERT INTO scenes (asset_id, start_s, score, source)
@@ -68,12 +75,6 @@ def sample_asset(
             [(asset_id, round(c.ts, 3), c.score) for c in changes],
         )
         result.scene_changes = len(changes)
-
-        grid_dir = settings.assets_dir / asset_id / "grid"
-        grid = extract_periodic_frames(
-            source, grid_dir, interval_s=settings.grid_interval_s,
-            width=GRID_WIDTH, prefix="grid",
-        )
 
         conn.execute("DELETE FROM frames WHERE asset_id = ? AND kind = 'grid'", (asset_id,))
         prev_gray: np.ndarray | None = None

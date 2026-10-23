@@ -96,8 +96,11 @@ def _add_dense_frames(
     dense_dir = settings.assets_dir / asset_id / "dense" / f"{start:.3f}"
     existing = {round(r["ts"], 3) for r in _frames_in(conn, asset_id, start, end, "dense")}
     added = 0
+    # Seek-scoped extraction: decode only this window's span, not the whole
+    # source (which previously cost one full decode per densified window).
     for ts, path in extract_periodic_frames(
-        source, dense_dir, interval_s=interval_s, width=512, prefix=f"d{start:.3f}"
+        source, dense_dir, interval_s=interval_s, width=512, prefix=f"d{start:.3f}",
+        start_s=start, end_s=end,
     ):
         if start <= ts < end and round(ts, 3) not in existing:
             conn.execute(
