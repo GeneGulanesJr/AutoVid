@@ -87,11 +87,8 @@ def upsert_env_values(values: dict[str, str], env_path: Path | None = None) -> N
 
 
 def mask_secret(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 8:
-        return "••••"
-    return f"{value[:4]}…{value[-4:]}"
+    """Set/unset only — the masked view must never leak key material."""
+    return "" if not value else "••••"
 
 
 def current_settings_view(settings: Settings) -> dict:

@@ -4,14 +4,17 @@ All clips come from :mod:`autovid.ffmpeg_io.clips` (same libx264/aac
 parameters), so a lossless concat copy is safe and fast. Transitions marked
 ``fade`` become fade-to/from-black on the affected clip (re-encode of that
 clip only). The render never touches originals; output lands in
-``catalog/renders/<edl_id>/``.
+``catalog/renders/<edl_id>/``. A byte-range lock file makes concurrent
+renders of the same EDL (e.g. CLI and web) fail fast instead of corrupting
+each other's staged clips.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import Settings
 from .edl import EDL
@@ -20,6 +23,46 @@ from .ffmpeg_io.bins import ffmpeg_path
 from .organize import slugify
 
 logger = logging.getLogger(__name__)
+
+try:
+    import msvcrt  # windows
+except ImportError:  # posix
+    msvcrt = None  # type: ignore[assignment]
+try:
+    import fcntl  # posix
+except ImportError:  # windows
+    fcntl = None  # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def _render_lock(lock_file: Path) -> Iterator[None]:
+    """One render per EDL dir across processes.
+
+    A byte-range lock (msvcrt on Windows, flock on POSIX) is released by the
+    OS when the owning process dies — a killed render can never wedge future
+    ones, which is why this is not a mkdir/pidfile lock.
+    """
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, "a+") as fh:
+        try:
+            if msvcrt is not None:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise AutoVidError(
+                f"another render of this EDL is already running "
+                f"(lock: {lock_file.name})"
+            ) from e
+        try:
+            yield
+        finally:
+            if msvcrt is not None:
+                with contextlib.suppress(OSError):
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _concat_line(path: Path) -> str:
@@ -129,11 +172,17 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
         details = "; ".join(e.message for e in validation.errors)
         raise AutoVidError(f"EDL failed validation: {details}")
 
+    out_dir = settings.data_dir / "renders" / board.id
+    with _render_lock(out_dir / ".render.lock"):
+        return _render_unlocked(conn, settings, board, out_dir)
+
+
+def _render_unlocked(conn, settings: Settings, board: EDL, out_dir: Path) -> Path:
+    """The render itself; caller holds the per-EDL lock."""
     pairs = _materialize(conn, settings, board)
     if not pairs:
         raise AutoVidError("EDL has no items")
 
-    out_dir = settings.data_dir / "renders" / board.id
     out_dir.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
     concat_file = out_dir / "concat.txt"

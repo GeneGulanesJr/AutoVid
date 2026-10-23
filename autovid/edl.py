@@ -157,7 +157,7 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
     placeholders = ",".join("?" * len({i.clip_id for i in board.items}))
     rows = conn.execute(
         f"""SELECT s.id, s.asset_id, s.start_s, s.end_s, a.path AS source_path,
-                   a.duration_s, a.width, a.height, a.fps
+                   a.duration_s, a.width, a.height, a.fps, a.has_audio
             FROM segments s JOIN assets a ON a.id = s.asset_id
             WHERE s.id IN ({placeholders})""",
         list({i.clip_id for i in board.items}),
@@ -166,6 +166,7 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
 
     sizes: set[tuple[int, int]] = set()
     rates: list[float] = []
+    audio_flags: set[bool] = set()
     for idx, item in enumerate(board.items):
         seg = segs.get(item.clip_id)
         if seg is None:
@@ -203,6 +204,7 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
             sizes.add((int(seg["width"]), int(seg["height"])))
         if seg["fps"]:
             rates.append(float(seg["fps"]))
+        audio_flags.add(bool(seg["has_audio"]))
 
         # Timeline placement (v2 items): overlaps corrupt the cut; gaps mean
         # the timeline silently diverges from the plan.
@@ -228,6 +230,10 @@ def validate_edl(conn: sqlite3.Connection, board: EDL) -> EDLValidation:
         issue("error", "mixed_resolution",
               "items span multiple resolutions "
               f"({', '.join(f'{w}x{h}' for w, h in sorted(sizes))}) — concat would corrupt the output")
+    if len(audio_flags) > 1:
+        issue("error", "mixed_audio",
+              "items mix audio and silent sources — the concat stream-copy would "
+              "drop or misalign the audio track")
     if rates and max(rates) - min(rates) > max(rates) * 0.01:
         issue("warning", "mixed_fps",
               f"items span frame rates {min(rates):.2f}–{max(rates):.2f} fps — playback may stutter")

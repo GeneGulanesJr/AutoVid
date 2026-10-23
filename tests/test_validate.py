@@ -94,6 +94,22 @@ def test_mixed_resolution_errors_mixed_fps_warns(conn, tmp_path) -> None:
     assert any(w.code == "mixed_fps" for w in v.warnings)
 
 
+def test_mixed_audio_blocks(conn, tmp_path) -> None:
+    """Audio and silent sources cannot stream-copy concat — invalid EDL."""
+    silent_src = tmp_path / "silent.mp4"
+    silent_src.write_bytes(b"\x00")
+    seed_asset(conn, "a_silent", duration=30.0, path=str(silent_src))
+    conn.execute("UPDATE assets SET has_audio = 1 WHERE id = 'a1'")
+    seed_segment(conn, "a1", 1)
+    seed_segment(conn, "a_silent", 2)
+    v = validate_edl(conn, EDL(items=[_item(1), _item(2, asset_id="a_silent")]))
+    assert any(e.code == "mixed_audio" for e in v.errors)
+
+    conn.execute("UPDATE assets SET has_audio = 1 WHERE id = 'a_silent'")
+    v = validate_edl(conn, EDL(items=[_item(1), _item(2, asset_id="a_silent")]))
+    assert v.ok, [e.message for e in v.errors]
+
+
 def test_target_overshoot_warns(conn) -> None:
     seed_segment(conn, "a1", 1, start=0.0, end=30.0)
     v = validate_edl(conn, EDL(target_duration_s=10.0, items=[_item(1, end=15.0)]))
