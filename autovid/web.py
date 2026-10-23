@@ -148,22 +148,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_settings() -> Settings:
         return holder["settings"]
 
-    conn_cache: dict[str, object] = {}
+    conn_cache = threading.local()
 
     def conn():
-        """One cached connection per database path, reused across requests.
+        """One cached connection per (thread, database path).
 
-        WAL lets these read-mostly connections run concurrent with the job
-        runner's own per-job write connections; this removes the per-request
-        connect + pragma + init_db churn. Settings changes that repoint
-        db_path simply open a second cached entry.
+        Per-thread, not global: sqlite3 connections must not interleave
+        statements from concurrent request threads — a shared connection
+        would merge separate requests' writes into one implicit transaction.
+        Cached because connect+pragmas+init_db per request was pure churn;
+        bounded by the threadpool size. Job threads open (and close) their
+        own connections.
         """
         s = holder["settings"]
         key = str(Path(s.db_path).resolve())
-        c = conn_cache.get(key)
+        per_path = getattr(conn_cache, "per_path", None)
+        if per_path is None:
+            per_path = conn_cache.per_path = {}
+        c = per_path.get(key)
         if c is None:
             c = db.connect(s.db_path)
-            conn_cache[key] = c
+            per_path[key] = c
         return c
 
     @app.get("/")
@@ -297,12 +302,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def target(job: Job) -> None:
             s = current_settings()
             c = db.connect(s.db_path)
-            board = load_edl(c, edl_id)
-            job.current = board.name
-            out = render_edl(c, s, board)
-            job.result = {"edl_id": edl_id, "path": str(out),
-                          "duration_s": board.duration_s}
-            job.log.append(f"rendered {out.name}")
+            try:
+                board = load_edl(c, edl_id)
+                job.current = board.name
+                out = render_edl(c, s, board)
+                job.result = {"edl_id": edl_id, "path": str(out),
+                              "duration_s": board.duration_s}
+                job.log.append(f"rendered {out.name}")
+            finally:
+                c.close()
 
         return runner.start("render", {"edl_id": edl_id}, target).view()
 
@@ -390,16 +398,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def target(job: Job) -> None:
             s = current_settings()
             c = db.connect(s.db_path)
-            from .ingest import ingest_folder
+            try:
+                from .ingest import ingest_folder
 
-            report = ingest_folder(
-                c, s, folder, recursive=params.recursive,
-                progress=lambda p, i, n: (
-                    setattr(job, "done", i), setattr(job, "total", n),
-                    setattr(job, "current", Path(p).name)),
-            )
-            job.log.append(f"added {len(report.added)}, duplicates {len(report.duplicates)}, "
-                           f"unchanged {len(report.skipped)}, failed {len(report.failed)}")
+                report = ingest_folder(
+                    c, s, folder, recursive=params.recursive,
+                    progress=lambda p, i, n: (
+                        setattr(job, "done", i), setattr(job, "total", n),
+                        setattr(job, "current", Path(p).name)),
+                )
+                job.log.append(f"added {len(report.added)}, duplicates {len(report.duplicates)}, "
+                               f"unchanged {len(report.skipped)}, failed {len(report.failed)}")
+            finally:
+                c.close()
 
         return runner.start("ingest", params.model_dump(), target).view()
 
@@ -435,6 +446,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             finally:
                 vlm.close()
                 decisions.close()
+                c.close()
 
         return target
 
@@ -469,27 +481,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             from .music import analyze_music
             from .planner import plan_music_video
 
-            job.current = "analyzing music"
-            analysis = analyze_music(music_file)
-            decisions = DecisionClient(s, c)
             try:
-                board = plan_music_video(
-                    c, s, analysis, objective=params.objective, mode=params.mode,
-                    style=params.style, name=params.name, decisions=decisions,
-                )
-            finally:
-                decisions.close()
-            out = {"edl_id": board.id, "items": len(board.items),
-                   "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
-            job.log.append(f"planned {len(board.items)} cuts @ "
-                           f"{analysis.tempo_bpm:.0f} BPM")
-            if params.render:
-                job.current = "rendering"
+                job.current = "analyzing music"
+                analysis = analyze_music(music_file)
+                decisions = DecisionClient(s, c)
                 try:
-                    out["render_path"] = str(render_edl(c, s, board))
-                except AutoVidError as e:
-                    out["render_error"] = str(e)
-            job.result = out
+                    board = plan_music_video(
+                        c, s, analysis, objective=params.objective, mode=params.mode,
+                        style=params.style, name=params.name, decisions=decisions,
+                    )
+                finally:
+                    decisions.close()
+                out = {"edl_id": board.id, "items": len(board.items),
+                       "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
+                job.log.append(f"planned {len(board.items)} cuts @ "
+                               f"{analysis.tempo_bpm:.0f} BPM")
+                if params.render:
+                    job.current = "rendering"
+                    try:
+                        out["render_path"] = str(render_edl(c, s, board))
+                    except AutoVidError as e:
+                        out["render_error"] = str(e)
+                job.result = out
+            finally:
+                c.close()
 
         return runner.start("music-plan", params.model_dump(), target).view()
 

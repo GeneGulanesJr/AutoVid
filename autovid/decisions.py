@@ -149,7 +149,8 @@ class DecisionClient:
 
     def close(self) -> None:
         """Release the cached MCP session and the background loop (idempotent)."""
-        loop, self._loop = self._loop, None
+        with self._loop_lock:
+            loop, self._loop = self._loop, None
         if loop is None or loop.is_closed():
             return
         if loop.is_running():
@@ -401,6 +402,7 @@ class DecisionClient:
 
     async def _reset_session(self) -> None:
         stack, self._session_stack, self._session = self._session_stack, None, None
+        self._session_lock = None  # a Lock binds to its loop; never reuse one
         if stack is not None:
             try:
                 await stack.aclose()
@@ -583,11 +585,14 @@ class DecisionClient:
         if self.conn is None:
             return
         try:
+            payload_json = json.dumps(payload, default=str)
+            if len(payload_json) > 4096:  # audit trail, not a data store — cap dumps
+                payload_json = payload_json[:4096]
             self.conn.execute(
                 """INSERT INTO decisions (asset_id, tool, action, payload_json,
                                           confidence, engine_version, elapsed_ms)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (asset_id, tool, action, json.dumps(payload, default=str),
+                (asset_id, tool, action, payload_json,
                  confidence, engine, elapsed_ms),
             )
             self.conn.commit()
