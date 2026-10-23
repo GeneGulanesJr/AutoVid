@@ -26,8 +26,6 @@ def launch(settings: Settings | None = None, *, port: int = DEFAULT_PORT,
            window: bool = True) -> None:
     """Start the app. With ``window=True`` and pywebview installed, opens a
     native window; otherwise opens the default browser tab."""
-    import threading
-
     import uvicorn
 
     from .web import create_app
@@ -89,7 +87,10 @@ def _start_decisionmcp(settings: Settings) -> subprocess.Popen | None:
     proc = subprocess.Popen([str(exe)], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     atexit.register(proc.terminate)  # we started it, we stop it
-    _wait_ready(health, timeout_s=90.0)  # model load takes a few seconds
+    # Model load can take a while — don't hold the UI hostage. Readiness shows
+    # up on the Setup page, and decision calls degrade to heuristics meanwhile.
+    threading.Thread(target=_wait_ready, args=(health, 90.0), daemon=True,
+                     name="decisionmcp-wait").start()
     return proc
 
 

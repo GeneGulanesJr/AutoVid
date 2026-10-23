@@ -240,14 +240,13 @@ async function loadSegments() {
     <td>${s.clip_path ? `<a href="/clips/${s.id}" target="_blank">clip</a>` : ""}</td></tr>`).join("");
 }
 async function loadReview() {
-  const all = await api("/api/segments");
-  const pending = all.filter(s => s.review_status === "pending");
+  const pending = await api("/api/segments?status=pending");
   $("#reviewTable tbody").innerHTML = pending.map(s => `<tr>
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict, "warn")}</td>
     <td>${s.decision_confidence == null ? "" : s.decision_confidence.toFixed(2)}</td>
     <td>${s.description || ""}</td>
-    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
+    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted preload="none"></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
     <td><div class="row-actions">
       <button class="act" onclick="review(${s.id},'approved')">approve</button>
       <button class="act" onclick="review(${s.id},'rejected')">reject</button>

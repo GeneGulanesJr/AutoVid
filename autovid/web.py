@@ -96,6 +96,8 @@ class JobRunner:
     """In-process background jobs. One job at a time — the pipeline is
     inherently sequential per catalog, and stages write the same tables."""
 
+    MAX_JOBS = 50  # long-lived desktop process: don't grow the history forever
+
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
@@ -108,6 +110,11 @@ class JobRunner:
                 raise HTTPException(409, f"job {running[0].id} ({running[0].stage}) "
                                          "is still running — wait for it first")
             self._jobs[job.id] = job
+            if len(self._jobs) > self.MAX_JOBS:
+                by_age = sorted(self._jobs.values(), key=lambda j: j.started)
+                for old in by_age[: len(self._jobs) - self.MAX_JOBS]:
+                    if old.state != "running":
+                        self._jobs.pop(old.id, None)
         thread = threading.Thread(target=self._wrap, args=(job, target), daemon=True)
         thread.start()
         return job
@@ -141,8 +148,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_settings() -> Settings:
         return holder["settings"]
 
+    conn_cache: dict[str, object] = {}
+
     def conn():
-        return db.connect(holder["settings"].db_path)
+        """One cached connection per database path, reused across requests.
+
+        WAL lets these read-mostly connections run concurrent with the job
+        runner's own per-job write connections; this removes the per-request
+        connect + pragma + init_db churn. Settings changes that repoint
+        db_path simply open a second cached entry.
+        """
+        s = holder["settings"]
+        key = str(Path(s.db_path).resolve())
+        c = conn_cache.get(key)
+        if c is None:
+            c = db.connect(s.db_path)
+            conn_cache[key] = c
+        return c
 
     @app.get("/")
     def index() -> FileResponse:
@@ -172,7 +194,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get("/api/segments")
-    def segments(asset_id: str | None = None, q: str | None = None) -> list[dict]:
+    def segments(
+        asset_id: str | None = None, q: str | None = None,
+        status: str | None = None, limit: int = 1000,
+    ) -> list[dict]:
         c = conn()
         sql = (
             "SELECT s.*, a.original_name FROM segments s JOIN assets a ON a.id = s.asset_id "
@@ -186,7 +211,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pattern = f"%{q.lower()}%"
             sql += " AND (lower(s.description) LIKE ? OR lower(s.tags_json) LIKE ?)"
             args += [pattern, pattern]
-        sql += " ORDER BY s.highlight_score DESC"
+        if status:
+            sql += " AND s.review_status = ?"
+            args.append(status)
+        sql += " ORDER BY s.highlight_score DESC LIMIT ?"
+        args.append(max(int(limit), 1))
         return [dict(r) for r in c.execute(sql, args).fetchall()]
 
     @app.post("/api/segments/{segment_id}/review")
