@@ -23,13 +23,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from . import agent as agent_mod
 from . import db
+from . import storyboard_doc as doc_mod
 from .analyze import analyze_asset
 from .config import Settings, get_settings
 from .decisions import DecisionClient
-from .edl import EDL, EDLItem, load as load_edl, save as save_edl
+from .edl import EDL, EDLItem, load as load_edl, save as save_edl, validate_edl
 from .errors import AutoVidError
 from .render import render_edl
+from .storyboard_doc import ScriptBeat, ScriptDocument, StoryboardScene
 from .vlm import VLMClient
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,35 @@ class MusicPlanParams(BaseModel):
     style: str = "cinematic"
     name: str = "music-cut"
     render: bool = True
+
+
+class StoryboardGenerateParams(BaseModel):
+    objective: str
+    target_duration_s: float = 30.0
+    style: str = "cinematic"
+    name: str = "storyboard"
+
+
+class StoryboardUpdate(BaseModel):
+    """Full-document replace of the current storyboard's scenes."""
+
+    scenes: list[StoryboardScene]
+    notes: str | None = None
+    missing_footage: list[str] | None = None
+
+
+class ScriptUpdate(BaseModel):
+    title: str | None = None
+    synopsis: str | None = None
+    beats: list[ScriptBeat]
+
+
+class RegenerateParams(BaseModel):
+    scene_id: str | None = None  # None = regenerate the whole board
+
+
+class RestoreParams(BaseModel):
+    version: int
 
 
 class Job:
@@ -290,10 +322,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/edls/{edl_id}/render")
     def render(edl_id: str) -> dict:
+        c = conn()
         try:
-            load_edl(conn(), edl_id)
+            board = load_edl(c, edl_id)
         except AutoVidError as e:
             raise HTTPException(404, str(e))
+        validation = validate_edl(c, board)
+        if not validation.ok:
+            raise HTTPException(400, "; ".join(e.message for e in validation.errors))
 
         # Renders take minutes (dozens of ffmpeg spawns) — run as a job so the
         # request returns at once and the browser polls progress. Also keeps
@@ -321,6 +357,176 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not path.is_relative_to((data_dir / "renders").resolve()) or not path.exists():
             raise HTTPException(404, "render not found")
         return FileResponse(path, media_type="video/mp4", filename=name)
+
+    @app.get("/api/edls/{edl_id}/validate")
+    def edl_validation(edl_id: str) -> dict:
+        try:
+            board = load_edl(conn(), edl_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        return validate_edl(conn(), board).model_dump()
+
+    # -- storyboards: Script · Storyboard · EDL ------------------------------
+
+    @app.get("/api/storyboards")
+    def storyboards_list() -> list[dict]:
+        return [dict(r) for r in doc_mod.list_boards(conn())]
+
+    @app.post("/api/storyboards/generate")
+    def storyboards_generate(params: StoryboardGenerateParams) -> dict:
+        # The agent is one or more LLM round trips (~30s each) — a job, like
+        # render/music. Falls back to the deterministic planner (recorded in
+        # the result origin) when no key is set or the draft fails the
+        # catalog gate twice.
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            try:
+                job.current = "planning storyboard"
+                board_id, origin = agent_mod.generate_with_fallback(
+                    c, s, objective=params.objective,
+                    target_duration_s=params.target_duration_s,
+                    style=params.style, name=params.name,
+                )
+                row = doc_mod.get_board(c, board_id)
+                document, version = doc_mod.load_document(c, board_id)
+                job.result = {
+                    "storyboard_id": board_id, "origin": origin, "version": version,
+                    "name": row["name"], "scenes": len(document.scenes),
+                    "duration_s": round(document.duration_s, 2),
+                    "missing_footage": document.missing_footage,
+                }
+                job.log.append(
+                    f"storyboard {board_id} via {origin}: "
+                    f"{len(document.scenes)} scenes, {document.duration_s:.1f}s")
+            finally:
+                c.close()
+
+        return runner.start("storyboard-generate", params.model_dump(), target).view()
+
+    @app.get("/api/storyboards/{storyboard_id}")
+    def storyboards_get(storyboard_id: str) -> dict:
+        c = conn()
+        try:
+            row = doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        document, version = doc_mod.load_document(c, storyboard_id)
+        script = doc_mod.load_script(c, storyboard_id)
+        return {
+            **dict(row), "current_version": version,
+            "document": document.model_dump(),
+            "script": script.model_dump() if script else None,
+            "versions": [dict(v) for v in doc_mod.list_versions(c, storyboard_id)],
+        }
+
+    @app.put("/api/storyboards/{storyboard_id}")
+    def storyboards_put(storyboard_id: str, update: StoryboardUpdate) -> dict:
+        c = conn()
+        try:
+            doc, _ = doc_mod.load_document(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        document = doc.model_copy(update={
+            "scenes": update.scenes,
+            "notes": update.notes if update.notes is not None else doc.notes,
+            "missing_footage": (update.missing_footage if update.missing_footage is not None
+                                else doc.missing_footage),
+        })
+        script = doc_mod.load_script(c, storyboard_id) \
+            or ScriptDocument(storyboard_id=storyboard_id)
+        problems = agent_mod.validate_document(c, document, script)
+        if problems:
+            raise HTTPException(400, "; ".join(problems))
+        version = doc_mod.save_document(c, storyboard_id, document, origin="user_edit")
+        return {"storyboard_id": storyboard_id, "version": version}
+
+    @app.put("/api/storyboards/{storyboard_id}/script")
+    def script_put(storyboard_id: str, update: ScriptUpdate) -> dict:
+        c = conn()
+        try:
+            doc_mod.get_board(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        script = doc_mod.load_script(c, storyboard_id) \
+            or ScriptDocument(storyboard_id=storyboard_id)
+        if update.title is not None:
+            script.title = update.title
+        if update.synopsis is not None:
+            script.synopsis = update.synopsis
+        script.beats = update.beats
+        doc_mod.save_script(c, script)  # marks dependent scenes stale + bumps version
+        document, version = doc_mod.load_document(c, storyboard_id)
+        return {
+            "storyboard_id": storyboard_id, "version": version,
+            "stale_scenes": [s.id for s in document.scenes if s.stale],
+        }
+
+    @app.post("/api/storyboards/{storyboard_id}/regenerate")
+    def storyboards_regenerate(storyboard_id: str, params: RegenerateParams) -> dict:
+        try:
+            doc_mod.get_board(conn(), storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        if not current_settings().vlm_api_key:
+            raise HTTPException(
+                409, "no VLM key configured — regeneration needs the agent; "
+                     "edit scenes manually or re-run generate (planner fallback)")
+
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            sb_agent = agent_mod.StoryboardAgent(s)
+            try:
+                job.current = "regenerating " + (params.scene_id or "whole storyboard")
+                version = sb_agent.regenerate(c, storyboard_id, scene_id=params.scene_id)
+                job.result = {"storyboard_id": storyboard_id, "version": version}
+                job.log.append(f"regenerated {params.scene_id or 'all'} → v{version}")
+            finally:
+                sb_agent.client.close()
+                c.close()
+
+        return runner.start(
+            "storyboard-regenerate",
+            {"storyboard_id": storyboard_id, **params.model_dump()}, target,
+        ).view()
+
+    @app.post("/api/storyboards/{storyboard_id}/compile")
+    def storyboards_compile(storyboard_id: str) -> dict:
+        c = conn()
+        try:
+            board = doc_mod.compile_to_edl(c, storyboard_id)
+        except AutoVidError as e:
+            raise HTTPException(400, str(e))
+        validation = validate_edl(c, board)
+        return {
+            "edl_id": board.id, "duration_s": board.duration_s,
+            "items": len(board.items),
+            "warnings": [w.model_dump() for w in validation.warnings],
+        }
+
+    @app.post("/api/storyboards/{storyboard_id}/approve")
+    def storyboards_approve(storyboard_id: str, approve: bool = True) -> dict:
+        try:
+            doc_mod.set_status(conn(), storyboard_id,
+                               "approved" if approve else "draft")
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        return {"storyboard_id": storyboard_id,
+                "status": "approved" if approve else "draft"}
+
+    @app.post("/api/storyboards/{storyboard_id}/restore")
+    def storyboards_restore(storyboard_id: str, params: RestoreParams) -> dict:
+        c = conn()
+        try:
+            document, restored_from = doc_mod.load_document(c, storyboard_id, params.version)
+        except AutoVidError as e:
+            raise HTTPException(404, str(e))
+        version = doc_mod.save_document(
+            c, storyboard_id, document, origin="restore",
+            note=f"restored from v{restored_from}")
+        return {"storyboard_id": storyboard_id, "version": version,
+                "restored_from": restored_from}
 
     # -- settings (edits .env in place) --------------------------------------
 

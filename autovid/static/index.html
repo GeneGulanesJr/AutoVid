@@ -41,6 +41,15 @@
   .jobbox .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:6px 0; }
   .jobbox .bar i { display:block; height:100%; background:var(--acc); transition:width .4s; }
   .log { font-family:Consolas,monospace; font-size:12px; color:var(--dim); max-height:120px; overflow:auto; white-space:pre-wrap; }
+  .sceneCard { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; display:flex; gap:12px; }
+  .sceneCard.selected { border-color:var(--acc); }
+  .sceneCard video { width:180px; height:101px; object-fit:cover; }
+  .sceneCard .grow { flex:1; }
+  .sceneCard input[type=text], .sceneCard input[type=number] { padding:3px 6px; }
+  .sceneCard textarea { width:100%; font:inherit; }
+  .shotRow { display:flex; gap:6px; align-items:center; margin-top:4px; flex-wrap:wrap; }
+  .beatRow { display:flex; gap:6px; align-items:flex-start; margin-bottom:6px; }
+  .beatRow textarea { flex:1; font:inherit; min-height:34px; }
 </style>
 </head>
 <body>
@@ -52,6 +61,7 @@
     <button data-view="catalog">Catalog</button>
     <button data-view="review">Review</button>
     <button data-view="music">Music</button>
+    <button data-view="board">Storyboard</button>
     <button data-view="edl">EDL</button>
   </nav>
   <span class="dim" id="statusLine"></span>
@@ -124,6 +134,37 @@
     <p class="dim" id="musicInfo"></p>
   </section>
 
+  <!-- STORYBOARD -->
+  <section id="view-board" class="hidden">
+    <div class="card">
+      <h4>Generate a storyboard</h4>
+      <div class="toolbar">
+        <input id="sbObjective" placeholder="objective — e.g. 60s hike recap" size="30">
+        <input id="sbDuration" type="number" value="30" min="5" style="width:80px" title="target seconds">
+        <span class="dim">s target</span>
+        <select id="sbStyle"><option>cinematic</option><option>fast_paced</option><option>social</option><option>informative</option></select>
+        <button class="act primary" onclick="generateBoard()">✦ Generate</button>
+      </div>
+      <p class="dim">The agent plans from the segment catalog only — it cannot invent footage
+      (invalid drafts get one repair round, then the deterministic planner takes over).
+      Every save is a new version; restore any of them.</p>
+    </div>
+    <div class="toolbar">
+      <select id="sbSelect" onchange="loadBoard()"></select>
+      <select id="sbVersions" title="version history"></select>
+      <button class="act" onclick="restoreVersion()">⟲ restore</button>
+      <button class="act" onclick="saveBoard()">💾 save</button>
+      <button class="act" onclick="regenAll()">✦ regen all</button>
+      <button class="act" id="approveBtn" onclick="toggleApprove()"></button>
+      <button class="act primary" onclick="compileBoard()">→ compile EDL</button>
+      <span id="sbInfo" class="dim"></span>
+    </div>
+    <div class="card" id="scriptPanel"></div>
+    <div id="sceneList"></div>
+    <div class="card hidden" id="missingPanel"></div>
+    <p class="dim" id="sbMsg"></p>
+  </section>
+
   <!-- EDL -->
   <section id="view-edl" class="hidden">
     <div class="toolbar">
@@ -132,6 +173,7 @@
       <button class="act" onclick="moveEdl(1)">↓ down</button>
       <button class="act" onclick="removeItem()">✕ remove</button>
       <button class="act" onclick="saveEdl()">Save</button>
+      <button class="act" onclick="validateEdl()">✓ Validate</button>
       <button class="act" onclick="renderEdl()">▶ Render</button>
       <span id="edlInfo" class="dim"></span>
     </div>
@@ -152,12 +194,13 @@ async function api(path, opts) {
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
-  ["setup","pipeline","catalog","review","music","edl"].forEach(v => $("#view-"+v).classList.toggle("hidden", v !== b.dataset.view));
+  ["setup","pipeline","catalog","review","music","board","edl"].forEach(v => $("#view-"+v).classList.toggle("hidden", v !== b.dataset.view));
   if (b.dataset.view === "setup") loadSetup();
   if (b.dataset.view === "pipeline") { loadAssets(); refreshJobs(); }
   if (b.dataset.view === "catalog") { loadAssets(); loadSegments(); }
   if (b.dataset.view === "review") loadReview();
   if (b.dataset.view === "music") loadEdlList();
+  if (b.dataset.view === "board") loadBoardView();
   if (b.dataset.view === "edl") loadEdlList();
 });
 const pill = (t, c) => `<span class="pill ${c||''}">${t}</span>`;
@@ -328,6 +371,205 @@ async function renderEdl() {
       $("#preview").src = `/renders/${EDL.id}/${name}`;
     });
   } catch (e) { $("#renderInfo").textContent = "render failed: " + e.message; }
+}
+async function validateEdl() {
+  try {
+    const v = await api(`/api/edls/${EDL.id}/validate`);
+    const msgs = [
+      ...v.errors.map(e => "ERROR " + e.code + ": " + e.message),
+      ...v.warnings.map(w => "warn " + w.code + ": " + w.message)];
+    $("#renderInfo").textContent = msgs.length ? msgs.join(" | ") : "valid — no issues";
+  } catch (e) { $("#renderInfo").textContent = "validate failed: " + e.message; }
+}
+
+// ---- storyboard (Script · Storyboard · EDL) ----
+let SB = null, SB_SEGS = [];
+const esc = (t) => String(t ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+const segOf = (id) => SB_SEGS.find(s => s.id === id);
+async function loadBoardView() {
+  SB_SEGS = await api("/api/segments");
+  await loadBoardList();
+}
+async function loadBoardList() {
+  const rows = await api("/api/storyboards");
+  $("#sbSelect").innerHTML = rows.map(b =>
+    `<option value="${b.id}">${b.name} (${b.id})</option>`).join("")
+    || '<option value="">no storyboards yet</option>';
+  if (rows.length) { $("#sbSelect").value = rows[0].id; await loadBoard(); }
+  else {
+    SB = null;
+    $("#sceneList").innerHTML = "";
+    $("#scriptPanel").innerHTML = '<span class="dim">Generate a storyboard above — it plans from the segment catalog.</span>';
+    $("#sbInfo").textContent = ""; $("#approveBtn").textContent = "";
+  }
+}
+async function loadBoard() {
+  const id = $("#sbSelect").value; if (!id) return;
+  SB = await api(`/api/storyboards/${id}`);
+  if (!SB.script) SB.script = {title:"", synopsis:"", beats:[]};
+  $("#sbVersions").innerHTML = SB.versions.map(v =>
+    `<option value="${v.version}">v${v.version} · ${v.origin}</option>`).join("");
+  drawBoard();
+}
+function drawBoard() {
+  if (!SB) return;
+  const d = SB.document;
+  $("#approveBtn").textContent = SB.status === "approved" ? "✓ approved" : "○ approve";
+  $("#approveBtn").style.color = SB.status === "approved" ? "var(--ok)" : "";
+  const dur = d.scenes.reduce((t,s) => t + (s.est_duration_s || 0), 0);
+  $("#sbInfo").textContent =
+    `${SB.status} · v${SB.current_version} · ${d.scenes.length} scenes · ${dur.toFixed(1)}s (target ${SB.target_duration_s}s)`;
+  $("#scriptPanel").innerHTML = `<h4>Script <span class="dim">(narration &amp; on-screen text — saving marks dependent scenes stale)</span></h4>
+    <div class="beatRow"><input type="text" value="${esc(SB.script.title)}" placeholder="title" style="flex:1" oninput="SB.script.title=this.value">
+    <button class="act" onclick="addBeat()">+ beat</button></div>
+    <div class="beatRow"><textarea placeholder="synopsis" oninput="SB.script.synopsis=this.value">${esc(SB.script.synopsis)}</textarea></div>
+    ${SB.script.beats.map((b,i) => `<div class="beatRow">
+      <input type="text" value="${esc(b.id)}" style="width:44px" title="beat id" onchange="SB.script.beats[${i}].id=this.value">
+      <input type="text" value="${esc(b.role)}" placeholder="role" style="width:90px" oninput="SB.script.beats[${i}].role=this.value">
+      <textarea placeholder="narration" oninput="SB.script.beats[${i}].narration=this.value">${esc(b.narration)}</textarea>
+      <input type="text" value="${esc(b.on_screen)}" placeholder="on-screen text" style="width:180px" oninput="SB.script.beats[${i}].on_screen=this.value">
+      <button class="act" onclick="SB.script.beats.splice(${i},1);drawBoard()">✕</button>
+    </div>`).join("")}
+    <button class="act" onclick="saveScript()">Save script</button> <span class="dim" id="scriptMsg"></span>`;
+  $("#sceneList").innerHTML = d.scenes.map((s,i) => {
+    const shot = s.shots[0];
+    const seg = shot ? segOf(shot.segment_id) : null;
+    return `<div class="sceneCard" id="scene_${esc(s.id)}">
+      ${seg && seg.clip_path ? `<video src="/clips/${shot.segment_id}" controls muted preload="metadata"></video>` : '<div class="dim" style="width:180px">no clip yet</div>'}
+      <div class="grow">
+        <div class="beatRow">
+          <b>${i+1}. ${esc(s.id)}</b>
+          <input type="text" value="${esc(s.title)}" placeholder="title" style="flex:1" oninput="updScene(${i},'title',this.value)">
+          <label class="dim"><input type="checkbox" ${s.locked?"checked":""} onchange="updScene(${i},'locked',this.checked)"> lock</label>
+          ${s.stale ? pill("stale","warn") : ""}
+          ${s.confidence != null ? pill("conf "+Number(s.confidence).toFixed(2), s.confidence < 0.4 ? "warn" : "ok") : ""}
+        </div>
+        <textarea rows="2" placeholder="description" oninput="updScene(${i},'description',this.value)">${esc(s.description)}</textarea>
+        ${(s.shots||[]).map((sh,j) => `<div class="shotRow">
+          <span class="dim">seg ${sh.segment_id}</span>
+          in <input type="number" step="0.1" value="${sh.source_start}" style="width:78px" onchange="updShot(${i},${j},'source_start',+this.value)">
+          out <input type="number" step="0.1" value="${sh.source_end}" style="width:78px" onchange="updShot(${i},${j},'source_end',+this.value)">
+          <select onchange="updShot(${i},${j},'transition_out',this.value)">
+            ${["cut","fade"].map(t=>`<option ${t===sh.transition_out?"selected":""}>${t}</option>`).join("")}
+          </select>
+        </div>`).join("")}
+        <div class="shotRow">
+          <select id="alt_${i}">
+            <option value="">swap with alternative…</option>
+            ${(s.alternates||[]).map(a => { const sa = segOf(a);
+              return `<option value="${a}">seg ${a}${sa ? " — " + esc((sa.description||"").slice(0,60)) : ""}</option>`; }).join("")}
+          </select>
+          <button class="act" onclick="swapAlternate(${i})">swap</button>
+          <button class="act" onclick="regenScene('${esc(s.id)}')">✦ regen</button>
+          <button class="act" onclick="moveScene(${i},-1)">↑</button>
+          <button class="act" onclick="moveScene(${i},1)">↓</button>
+          <button class="act" onclick="removeScene(${i})">✕</button>
+        </div>
+        ${(s.open_issues&&s.open_issues.length) ? `<div class="dim">⚠ ${s.open_issues.map(esc).join(" · ")}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("") || '<div class="card dim">no scenes</div>';
+  const missing = d.missing_footage || [];
+  $("#missingPanel").classList.toggle("hidden", !missing.length);
+  $("#missingPanel").innerHTML = `<h4>Missing footage <span class="dim">(the story asked for shots the catalog lacks)</span></h4>` +
+    missing.map(m => `<div>• ${esc(m)}</div>`).join("");
+}
+function updScene(i, field, value) { SB.document.scenes[i][field] = value; }
+function updShot(i, j, field, value) { SB.document.scenes[i].shots[j][field] = value; }
+function addBeat() {
+  SB.script.beats.push({id:"b"+(SB.script.beats.length+1), role:"development",
+    narration:"", dialogue:"", on_screen:""});
+  drawBoard();
+}
+function moveScene(i, d) {
+  const scenes = SB.document.scenes;
+  if (i + d < 0 || i + d >= scenes.length) return;
+  [scenes[i], scenes[i+d]] = [scenes[i+d], scenes[i]];
+  drawBoard();
+}
+function removeScene(i) { SB.document.scenes.splice(i, 1); drawBoard(); }
+function swapAlternate(i) {
+  const alt = +$("#alt_"+i).value;
+  if (!alt) return;
+  const scene = SB.document.scenes[i];
+  const seg = segOf(alt);
+  if (!seg) return;
+  const old = scene.shots[0];
+  const span = old ? old.source_end - old.source_start : 4;
+  scene.shots = [{segment_id: alt, asset_id: seg.asset_id,
+    source_start: seg.start_s, source_end: Math.min(seg.start_s + span, seg.end_s),
+    transition_out: old ? old.transition_out : "cut"}];
+  scene.stale = false;
+  drawBoard();
+}
+async function saveBoard() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}`, {method:"PUT", body:{
+      scenes: SB.document.scenes, notes: SB.document.notes,
+      missing_footage: SB.document.missing_footage}});
+    $("#sbMsg").textContent = `saved v${r.version}`;
+    await loadBoard();
+  } catch (e) { $("#sbMsg").textContent = "save failed: " + e.message; }
+}
+async function saveScript() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}/script`, {method:"PUT", body:{
+      title: SB.script.title, synopsis: SB.script.synopsis, beats: SB.script.beats}});
+    $("#scriptMsg").textContent = r.stale_scenes.length
+      ? `saved — stale scenes: ${r.stale_scenes.join(", ")}` : "saved";
+    await loadBoard();
+  } catch (e) { $("#scriptMsg").textContent = "failed: " + e.message; }
+}
+async function regenScene(sceneId) {
+  $("#sbMsg").textContent = "regenerating " + sceneId + "…";
+  try {
+    const j = await api(`/api/storyboards/${SB.id}/regenerate`,
+      {method:"POST", body:{scene_id: sceneId}});
+    watch(j.id, () => loadBoard());
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
+}
+async function regenAll() {
+  $("#sbMsg").textContent = "regenerating whole storyboard…";
+  try {
+    const j = await api(`/api/storyboards/${SB.id}/regenerate`, {method:"POST", body:{}});
+    watch(j.id, () => loadBoard());
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
+}
+async function toggleApprove() {
+  await api(`/api/storyboards/${SB.id}/approve?approve=${SB.status !== "approved"}`, {method:"POST"});
+  await loadBoard();
+}
+async function restoreVersion() {
+  const v = +$("#sbVersions").value;
+  if (!v) return;
+  const r = await api(`/api/storyboards/${SB.id}/restore`, {method:"POST", body:{version: v}});
+  $("#sbMsg").textContent = `restored v${r.restored_from} as v${r.version}`;
+  await loadBoard();
+}
+async function compileBoard() {
+  try {
+    const r = await api(`/api/storyboards/${SB.id}/compile`, {method:"POST"});
+    $("#sbMsg").innerHTML = `compiled <b>${r.edl_id}</b>: ${r.items} items, ${r.duration_s.toFixed(1)}s` +
+      (r.warnings.length ? ` — ${r.warnings.length} warning(s) (see EDL → Validate)` : "");
+    loadEdlList();
+  } catch (e) { $("#sbMsg").textContent = "compile failed: " + e.message; }
+}
+async function generateBoard() {
+  const objective = $("#sbObjective").value.trim();
+  if (!objective) { $("#sbMsg").textContent = "give the edit an objective first"; return; }
+  $("#sbMsg").textContent = "planning… (watch Pipeline for progress)";
+  try {
+    const j = await api("/api/storyboards/generate", {method:"POST", body:{
+      objective, target_duration_s: +$("#sbDuration").value || 30,
+      style: $("#sbStyle").value, name: "storyboard"}});
+    watch(j.id, (done) => {
+      if (done.state !== "done") { $("#sbMsg").textContent = "failed: " + (done.error || "unknown"); return; }
+      const out = done.result;
+      $("#sbMsg").innerHTML = `planned <b>${out.storyboard_id}</b> via ${out.origin} — ${out.scenes} scenes` +
+        (out.missing_footage && out.missing_footage.length ? " · has missing footage" : "");
+      loadBoardView();
+    });
+  } catch (e) { $("#sbMsg").textContent = "failed: " + e.message; }
 }
 
 loadSetup(); loadAssets(); loadSegments();

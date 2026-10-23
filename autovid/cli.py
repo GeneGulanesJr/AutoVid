@@ -326,6 +326,97 @@ def storyboard(
 
 
 @app.command()
+def agent(
+    objective: str = typer.Argument(..., help="Editing objective, e.g. '60s hike recap'."),
+    duration: float = typer.Option(30.0, help="Target duration in seconds."),
+    style: str = typer.Option(
+        "cinematic", help="fast_paced | social | cinematic | informative."),
+    name: str = typer.Option("storyboard", help="Storyboard name."),
+    plan_only: bool = typer.Option(False, "--plan-only", help="Skip compiling to an EDL."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Storyboard Agent: script + storyboard from the catalog.
+
+    Uses the text LLM when AUTOVID_VLM_API_KEY is set (catalog-gated — it can
+    only reference real segments); otherwise, or on invalid drafts, falls
+    back to the deterministic planner.
+    """
+    from . import storyboard_doc as doc_mod
+    from .agent import generate_with_fallback
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+
+    try:
+        board_id, origin = generate_with_fallback(
+            conn, settings, objective=objective, target_duration_s=duration,
+            style=style, name=name,
+        )
+    except Exception as e:  # noqa: BLE001 — surfaced to the user
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    row = doc_mod.get_board(conn, board_id)
+    document, version = doc_mod.load_document(conn, board_id)
+    console.print(
+        f"[green]Storyboard {board_id} v{version}[/green] (via {origin}): "
+        f"{len(document.scenes)} scenes, {document.duration_s:.1f}s "
+        f"(target {duration:.1f}s)")
+    for scene in document.scenes:
+        shot = scene.shots[0] if scene.shots else None
+        span = f"seg {shot.segment_id} {shot.source_start:.1f}-{shot.source_end:.1f}s" \
+            if shot else "no shots"
+        console.print(
+            f"  {scene.id:>4} [{scene.narrative_role or '—'}] {scene.title}: {span}"
+            + (" [stale]" if scene.stale else "")
+            + (" [locked]" if scene.locked else ""))
+    if document.missing_footage:
+        console.print("[yellow]Missing footage the story asked for:[/yellow]")
+        for m in document.missing_footage:
+            console.print(f"  - {m}")
+    if plan_only:
+        return
+    try:
+        board = doc_mod.compile_to_edl(conn, board_id)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Compile failed: {e}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]EDL {board.id}[/green]: {len(board.items)} items, "
+        f"{board.duration_s:.1f}s — render it or fine-tune in the web UI.")
+
+
+@app.command()
+def boards(
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """List saved storyboards (the agent/planner planning artifacts)."""
+    from . import storyboard_doc as doc_mod
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    rows = doc_mod.list_boards(conn)
+    if not rows:
+        console.print("[yellow]No storyboards yet — run `autovid agent`.[/yellow]")
+        raise typer.Exit()
+    table = Table(title="Storyboards")
+    table.add_column("id")
+    table.add_column("name")
+    table.add_column("objective", overflow="fold")
+    table.add_column("style")
+    table.add_column("status")
+    table.add_column("ver", justify="right")
+    table.add_column("updated")
+    for r in rows:
+        table.add_row(r["id"], r["name"], r["objective"], r["style"],
+                      r["status"], str(r["versions"]), r["updated_at"])
+    console.print(table)
+
+
+@app.command()
 def edls(
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
@@ -365,7 +456,11 @@ def render(
     conn = db.connect(settings.db_path)
     board = edl_mod.load(conn, edl_id)
     with console.status("Rendering…"):
-        out = render_edl(conn, settings, board)
+        try:
+            out = render_edl(conn, settings, board)
+        except Exception as e:  # noqa: BLE001 — validation + render errors
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
     console.print(f"[green]Rendered:[/green] {out} ({board.duration_s:.1f}s)")
 
 

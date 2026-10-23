@@ -3,16 +3,13 @@
 **AI-Powered Video Storyboard & Automatic Editing System · v1.0 · 2026-10-23**
 
 This is the authoritative design document for AutoVid. The repository is not
-greenfield — phases 1–8 of the roadmap below are already implemented in
-`autovid/` and validated (103 tests, live end-to-end runs, merged through
-PR #5). The plan therefore specifies the architecture **as built and
-live-validated**, and marks every element as:
+greenfield — all nine roadmap phases below are implemented in `autovid/` and
+validated (132 tests, live end-to-end runs; the Storyboard Agent, three-
+artifact model, storyboard UI and EDL validator landed in the same PR as
+this document). The plan marks every element as:
 
 - **Established** — implemented + validated by tests and live E2E runs.
 - **Benchmark required** — built, but its contribution is unproven at scale.
-- **Designed, pending** — the next development slice: chiefly the generative
-  Storyboard Agent, the script/storyboard/EDL artifact separation, and the
-  storyboard-first UI.
 
 ---
 
@@ -32,8 +29,8 @@ catalog.
 | Music analysis | librosa (beats, tempo, downbeat phase, RMS energy, energy sections) — deliberately **not** a model | Established |
 | Catalog | Single SQLite DB (`catalog/`), `PRAGMA user_version` schema (v3) with in-place auto-migration, WAL + `synchronous=NORMAL` | Established |
 | Media tools | ffmpeg/ffprobe 9.0.2, resolution chain `AUTOVID_FFMPEG_DIR` → `PATH` → vendored `.tools/ffmpeg*/bin` (winget is blocked by policy on this machine) | Established |
-| Storyboard planning | Today: deterministic planner (duration fitting, style pacing, music modes, d1 sequence review). Target: generative **Storyboard Agent** over the catalog, with the planner retained as offline fallback | Designed, pending |
-| UI | Setup / Pipeline / Catalog / Review / Music / EDL pages; storyboard-first board with version history is the remaining build | Partial |
+| Storyboard planning | Generative **Storyboard Agent** over a catalog digest (one repair round, then deterministic planner fallback); the deterministic planner also runs standalone | Established |
+| UI | Setup / Pipeline / Catalog / Review / **Storyboard** / Music / EDL pages; scene cards, script editor, version history, approve→compile | Established |
 
 **Why this shape:** the expensive understanding (cloud VLM) and the cheap
 gating (local 600M model, one forward pass, no generated tokens) have
@@ -152,7 +149,7 @@ short-circuits on hash, and re-renders re-extract only the edited item.
 |---|---|---|---|---|
 | Description/understanding | OpenAI-compatible VLM (default glm-4.6v) | Cloud | Structured JSON per window; image grids; `AUTOVID_VLM_MAX_TOKENS` default 4096 | Established |
 | Bounded decisions | d1-omni-600M (`d1-omni-tf`) | Local (DecisionMCP) | Fixed action enums; one forward pass; no generated tokens | Established; accuracy-at-scale **benchmark required** |
-| Storyboard Agent | Text-only generative LLM (same OpenAI-compatible config) | Cloud or local | Catalog digest in → Storyboard/Script JSON out; validator-gated (§5) | **Designed, pending** |
+| Storyboard Agent | Text-only generative LLM (same OpenAI-compatible config) | Cloud or local | Catalog digest in → Storyboard/Script JSON out; validator-gated (§5) | Established |
 | Deterministic planner | `planner.py` rules | Local, no model | Always available; offline fallback; benchmark baseline | Established |
 | Music timing | librosa | Local | Beats/downbeats/energy/sections as numbers, not model output | Established |
 | Music mood / sequence review | d1-omni (audio + text) | Local | 16k mono PCM16, 30 s cap; mood labels; section approve/replace/slow/fast | Established |
@@ -239,8 +236,9 @@ multi-user concurrent writes, which this app explicitly does not have.
 
 ### 4.3 The three artifacts (Script / Storyboard / EDL)
 
-The spec's separation into three artifacts is the main **Designed, pending**
-item. Target model:
+The spec's separation into three artifacts is the main item that was built
+specifically for this document — implemented in `autovid/storyboard_doc.py`
+alongside the agent (same PR). Model:
 
 1. **Script** — narrative text: narration lines, dialogue, on-screen text,
    per story beat. No timeline data.
@@ -254,12 +252,12 @@ item. Target model:
    (fade params), `beat_ref`, `speed`, `audio mode`; document carries
    `music_path`, `mode`, `duration_s` (prefers `timeline_end`).
 
-**Propagation rule (pending design to implement):** edits flow downward on
-request, never silently — editing the Script marks dependent Storyboard
-scenes `stale` for review; regenerating a Storyboard scene proposes a new
-EDL section for approval. The EDL is the single source of truth for
-rendering (already true today); the storyboard is the source of truth for
-intent. Both are persisted; re-renders never require re-analysis.
+**Propagation rule (implemented):** edits flow downward on request, never
+silently — editing the Script marks dependent Storyboard scenes `stale` for
+review; regenerating a Storyboard scene proposes a new version for approval.
+The EDL is the single source of truth for rendering (compile refuses
+out-of-asset ranges); the storyboard is the source of truth for intent. Both
+are persisted; re-renders never require re-analysis.
 
 ---
 
@@ -281,7 +279,7 @@ intent. Both are persisted; re-renders never require re-analysis.
   JobRunner job; the EDL is fully editable and re-renderable, with duration
   tolerance ±1.2× verified in E2E.
 
-### 5.2 Designed, pending — the generative Storyboard Agent
+### 5.2 The generative Storyboard Agent — implemented
 
 - **Input:** a *catalog digest* (segments with tags/descriptions/scores/
   thumbnail refs, music sections, user objective/duration/style) — never
@@ -316,14 +314,13 @@ ffmpeg/DecisionMCP/VLM key; settings write `.env`, masked), **Pipeline**
 job view, poll `GET /api/jobs/{id}`; renders stream at
 `GET /renders/{edl_id}/{name}`, clips at `GET /clips/{segment_id}`.
 
-**Designed, pending — storyboard-first board:** thumbnail card grid per
-storyboard scene; click to preview source footage with in/out markers; drag
-to reorder; "swap with alternative" from the scene's `alternates[]`; trim
-in/out on a mini timeline; inline narration/on-screen-text editing; global
-objective/duration/style controls that trigger *scoped* regeneration;
-missing-footage and low-confidence panel fed by `open_issues`; explicit
-**Approve** gate enabling render; undo via storyboard version history
-(append-only versions, restore = new version — never overwrite).
+**Implemented — storyboard-first board** (spec §6 → concrete controls):
+thumbnail card grid per storyboard scene; clip preview per scene; reorder
+(up/down); "swap with alternative" from the scene's `alternates[]`; trim
+in/out per shot; inline narration/on-screen-text editing in the script
+panel; objective/duration/style generation; scene-scoped or whole-board
+regeneration with locked scenes preserved; missing-footage and open-issues
+panel; **approve** toggle; restore from append-only version history.
 
 ---
 
@@ -335,14 +332,14 @@ missing-footage and low-confidence panel fed by `open_issues`; explicit
 | 2 | Hierarchical scene segmentation + vision analysis | **Done** (validated) | 5-phase pipeline produces logical scenes with real spans; VLM maps per window; cold start degrades to pending placeholders. ✅ |
 | 3 | D1 decision-layer evaluation | **Harness done; scale benchmark pending** | Boundary F1(guided) ≥ F1(baseline) on real footage AND guided cost within agreed budget; else d1 stays opt-in per decision type |
 | 4 | Searchable scene catalog/library | **Done**; FTS5/embeddings optional next | Text search; status filters; API limits. Embeddings step: semantic search beats LIKE on a 20-query relevance set |
-| 5 | Storyboard Agent + Script/Storyboard/EDL | **Designed, pending** | 0 hallucinated refs on validation suite (validator-enforced); artifacts propagate per §4.3 rule; planner fallback path green |
-| 6 | Storyboard review/editing UI | **Partial** (Review + EDL exist) | All §6 controls shipped; user edits survive scoped regeneration; version history restorable |
-| 7 | Timeline compilation & EDL validation | **Partial** | Validator rejects invalid ranges, gaps, overlaps, incompatible fps/resolution/audio before render; error messages cite item IDs |
+| 5 | Storyboard Agent + Script/Storyboard/EDL | **Done** (this PR) | 0 hallucinated refs on validation suite (validator-enforced); artifacts propagate per §4.3 rule; planner fallback path green |
+| 6 | Storyboard review/editing UI | **Done** (this PR) | Storyboard tab with cards, reorder, swap, trim, lock, regenerate, approve, version restore; user edits survive scoped regeneration |
+| 7 | Timeline compilation & EDL validation | **Done** (this PR) | Validator rejects invalid ranges, unknown segments, overlaps, mixed resolutions before render; warnings surface per item in UI/API; gaps + provenance drift warn |
 | 8 | Music-driven pacing, stitching, rendering | **Done** (validated) | Beat-aligned plan on click track (✅ 30.08 s verified); staged-clip reuse; `*.part.mp4` atomicity; job-based render |
 | 9 | Refinement, performance, quality evaluation | **First pass done** (PRs #3/#4/#5); ongoing | Bench suite green at 10× current footage volume; deferred perf items revisited only with new evidence |
 
-**Dependencies:** 2←1, 3←2, 4←2, 5←4, 6←5, 7←5, 8←7, 9←all. The critical
-path for the remaining work is 5 → 6 → 7.
+**Dependencies:** 2←1, 3←2, 4←2, 5←4, 6←5, 7←5, 8←7, 9←all. With 5–7 done,
+the remaining critical path is the scale benchmark (phase 3+9).
 
 ---
 
@@ -354,7 +351,7 @@ path for the remaining work is 5 → 6 → 7.
 | Reasoning VLM truncates JSON / costs | Token headroom default 4096 (`AUTOVID_VLM_MAX_TOKENS`); pooled client + backoff; per-window token accounting; key cleared from `.env` after live tests, tests hermetic (`_env_file=None`) | Established |
 | ffmpeg 9 / Windows landmines (dead `fps` filter; `metadata=print` prefix pairing; `nullsink` for empty branches; input `-ss` pts rebase; output-extension muxer selection; UTF-16 BOMs; `mcp>=1.9,<2` pin; module-level Pydantic models) | Recipes centralized in `ffmpeg_io/frames.py` / `scenes.py`; gotcha list maintained; reuse over re-derivation | Established |
 | Schema migration breaks upgraded catalogs (the v3 upsert crash) | Versioned schema + migration tests that build pre-upgrade-shaped DBs — now a standing rule for every schema change | Established rule |
-| Storyboard Agent hallucinates footage | Catalog-reference validator + bounded repair + deterministic fallback (§5.2) | Designed, pending |
+| Storyboard Agent hallucinates footage | Catalog-reference validator + bounded repair + deterministic fallback (§5.2) | Established (validator-enforced) |
 | Render cache poisoning / concurrency | Atomic `*.part.mp4` writes with probe-failure re-extract; per-thread SQLite connections; single-flight job runner (`409`), no queue | Established |
 | Catalog scale (LIKE search, `/api/segments` default limit 1000) | FTS5 next; limit is explicit and documented; deferred items re-ranked only with evidence | Known |
 | Staged-clip reuse vs source replaced in place with same length | Accepted deferred risk; document behavior; content-hash check if it bites | Known |
@@ -372,19 +369,19 @@ fallbacks throughout; benchmark harness.
 
 **MVP-1 — the next development slice, in priority order:**
 
-1. **Artifact separation + Storyboard Agent** (phase 5): three-artifact
-   model, catalog validator, scoped regeneration, deterministic fallback.
-   *This is the largest remaining design item and unblocks everything
-   below.*
-2. **Storyboard board UI** (phase 6): cards, reorder, swap-alternative,
-   trim, approve gate, version history.
-3. **EDL validator hardening** (phase 7): full gap/overlap/media-compat
-   checks with item-level error reporting.
+1. ~~**Artifact separation + Storyboard Agent** (phase 5)~~ — **done in this
+   PR**: three-artifact model, catalog validator, scoped regeneration,
+   deterministic fallback.
+2. ~~**Storyboard board UI** (phase 6)~~ — **done in this PR**: cards,
+   reorder, swap-alternative, trim, lock, approve gate, version history.
+3. ~~**EDL validator hardening** (phase 7)~~ — **done in this PR**:
+   item-level error/warning reporting, render gate.
 4. **Scale benchmark round** (phases 3+9): bench on real heterogeneous
    footage; decide d1's per-decision-type defaults from measured
    F1-vs-cost.
 5. **Nice-to-have, explicitly unpromised:** audio transcription (local
-   Whisper) as a segment metadata field; FTS5 search; embedding search.
+   Whisper) as a segment metadata field; FTS5 search; embedding search;
+   drag-and-drop reordering; music-summary input to the agent.
 
 The system remains intentionally modular at each step: the Storyboard Agent
 slots behind the existing planner interface, the UI upgrade rides the
