@@ -81,13 +81,14 @@ class Job:
         self.current = ""
         self.log: list[str] = []
         self.error: str | None = None
+        self.result: dict = {}  # endpoint-specific payload, set when done
         self.started = time.time()
 
     def view(self) -> dict:
         return {
             "id": self.id, "stage": self.stage, "state": self.state,
             "done": self.done, "total": self.total, "current": self.current,
-            "log": self.log[-8:], "error": self.error,
+            "log": self.log[-8:], "error": self.error, "result": self.result,
         }
 
 
@@ -255,13 +256,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/edls/{edl_id}/render")
     def render(edl_id: str) -> dict:
-        c = conn()
         try:
-            board = load_edl(c, edl_id)
-            out = render_edl(c, current_settings(), board)
+            load_edl(conn(), edl_id)
         except AutoVidError as e:
-            raise HTTPException(409, str(e))
-        return {"edl_id": edl_id, "path": str(out), "duration_s": board.duration_s}
+            raise HTTPException(404, str(e))
+
+        # Renders take minutes (dozens of ffmpeg spawns) — run as a job so the
+        # request returns at once and the browser polls progress. Also keeps
+        # the one-job-at-a-time guard: a render must not interleave with a
+        # pipeline stage writing the same tables.
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            board = load_edl(c, edl_id)
+            job.current = board.name
+            out = render_edl(c, s, board)
+            job.result = {"edl_id": edl_id, "path": str(out),
+                          "duration_s": board.duration_s}
+            job.log.append(f"rendered {out.name}")
+
+        return runner.start("render", {"edl_id": edl_id}, target).view()
 
     @app.get("/renders/{edl_id}/{name}")
     def rendered(edl_id: str, name: str) -> FileResponse:
@@ -374,20 +388,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             targets = [asset_id] if asset_id else [
                 r["id"] for r in pending_assets(c, status_for[stage])]
             job.total = len(targets)
-            for aid in targets:
-                job.current = aid
-                if stage == "sample":
-                    sampling.sample_asset(c, s, aid)
-                elif stage == "analyze":
-                    analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
-                elif stage == "cut":
-                    cut_asset(c, s, aid, decisions=decisions)
-                else:
-                    from .organize import organize_asset
+            try:
+                for aid in targets:
+                    job.current = aid
+                    if stage == "sample":
+                        sampling.sample_asset(c, s, aid)
+                    elif stage == "analyze":
+                        analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
+                    elif stage == "cut":
+                        cut_asset(c, s, aid, decisions=decisions)
+                    else:
+                        from .organize import organize_asset
 
-                    organize_asset(c, s, aid)
-                job.done += 1
-                job.log.append(f"{aid}: done")
+                        organize_asset(c, s, aid)
+                    job.done += 1
+                    job.log.append(f"{aid}: done")
+            finally:
+                vlm.close()
+                decisions.close()
 
         return target
 
@@ -410,31 +428,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/music/plan")
     def music_plan(params: MusicPlanParams) -> dict:
-        s = current_settings()
-        c = conn()
         music_file = Path(params.music_path)
         if not music_file.exists():
             raise HTTPException(400, f"music file not found: {params.music_path}")
-        from .music import analyze_music
-        from .planner import plan_music_video
 
-        try:
+        # Librosa analysis + per-section mood calls + render take minutes —
+        # job, not request (same reasoning as the render endpoint).
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            from .music import analyze_music
+            from .planner import plan_music_video
+
+            job.current = "analyzing music"
             analysis = analyze_music(music_file)
             decisions = DecisionClient(s, c)
-            board = plan_music_video(
-                c, s, analysis, objective=params.objective, mode=params.mode,
-                style=params.style, name=params.name, decisions=decisions,
-            )
-        except (AutoVidError, ValueError) as e:
-            raise HTTPException(409, str(e))
-        out = {"edl_id": board.id, "items": len(board.items),
-               "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
-        if params.render:
             try:
-                out["render_path"] = str(render_edl(c, s, board))
-            except AutoVidError as e:
-                out["render_error"] = str(e)
-        return out
+                board = plan_music_video(
+                    c, s, analysis, objective=params.objective, mode=params.mode,
+                    style=params.style, name=params.name, decisions=decisions,
+                )
+            finally:
+                decisions.close()
+            out = {"edl_id": board.id, "items": len(board.items),
+                   "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
+            job.log.append(f"planned {len(board.items)} cuts @ "
+                           f"{analysis.tempo_bpm:.0f} BPM")
+            if params.render:
+                job.current = "rendering"
+                try:
+                    out["render_path"] = str(render_edl(c, s, board))
+                except AutoVidError as e:
+                    out["render_error"] = str(e)
+            job.result = out
+
+        return runner.start("music-plan", params.model_dump(), target).view()
 
     return app
 

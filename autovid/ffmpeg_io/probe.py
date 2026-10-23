@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,24 @@ def _parse_fps(rate: str | None) -> float:
         return 0.0
 
 
+@lru_cache(maxsize=512)
+def _probe_cached(path: str, mtime_ns: int, size: int) -> MediaInfo:
+    return _probe_uncached(path)
+
+
 def probe(path: str | Path) -> MediaInfo:
+    """Run ``ffprobe -show_format -show_streams`` and reduce to MediaInfo.
+
+    Results are cached per (path, mtime, size): renders re-probe the same
+    immutable derived clips across stages/items, and a re-written file gets a
+    new mtime, so entries stay correct.
+    """
+    p = Path(path)
+    st = p.stat()  # missing file → caller sees the OSError, cache untouched
+    return _probe_cached(str(p), st.st_mtime_ns, st.st_size)
+
+
+def _probe_uncached(path: str) -> MediaInfo:
     """Run ``ffprobe -show_format -show_streams`` and reduce to MediaInfo."""
     cmd = [
         ffprobe_path(),
