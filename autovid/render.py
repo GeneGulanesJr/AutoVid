@@ -36,7 +36,7 @@ def _fade_clip(src: Path, dst: Path, *, fade_in: bool, fade_out: bool) -> Path:
         ffmpeg_path(), "-y", "-v", "error", "-i", str(src),
         "-vf", ",".join(vf),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-c:a", "aac", str(dst),
+        "-c:a", "copy", str(dst),  # fade is video-only; clips are already AAC
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0 or not dst.exists():
@@ -51,7 +51,9 @@ def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]
       whole scene span (the classic storyboard case).
     - Music-driven items trim sub-spans of a scene, so each such item gets an
       accurate per-item clip cut from the source (staged in the render dir —
-      reproducible, never written back over the scene clip).
+      reproducible, never written back over the scene clip). Staged clips are
+      named by provenance ``(segment, start, end)``, so re-renders reuse them
+      instead of re-extracting the whole timeline after a one-item edit.
     """
     from .edl import EDLItem
     from .ffmpeg_io.clips import extract_clip
@@ -83,9 +85,15 @@ def _materialize(conn, settings: Settings, board: EDL) -> list[tuple[Any, Path]]
         source = Path(row["source_path"])
         if not source.exists():
             raise AutoVidError(f"source file missing for segment {item.clip_id}: {source}")
-        out = settings.data_dir / "renders" / board.id / f"item_{i:04d}.mp4"
-        extract_clip(source, out, start_s=item.source_start, end_s=item.source_end)
-        pairs.append((item, out))
+        staged = (
+            settings.data_dir / "renders" / board.id
+            / f"item_{item.clip_id}_{item.source_start:.3f}-{item.source_end:.3f}.mp4"
+        )
+        if staged.exists() and abs(probe(staged).duration_s - item_span) < 0.25:
+            pairs.append((item, staged))
+            continue
+        extract_clip(source, staged, start_s=item.source_start, end_s=item.source_end)
+        pairs.append((item, staged))
     return pairs
 
 
@@ -121,49 +129,57 @@ def render_edl(conn, settings: Settings, board: EDL) -> Path:
         concat_file.write_text(
             "\n".join(f"file '{p.as_posix()}'" for p in staged), encoding="utf-8"
         )
-        cmd = [
-            ffmpeg_path(), "-y", "-v", "error",
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-c", "copy", "-movflags", "+faststart", str(concat_out),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if proc.returncode != 0 or not concat_out.exists():
-            raise AutoVidError(
-                f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
-            )
-
         if board.music_path:
-            _mux_music(concat_out, Path(board.music_path), out_path)
+            # Single pass: the concat demuxer feeds the muxer directly, so the
+            # stitched video is never written to disk just to be re-read.
+            _render_with_music(concat_file, Path(board.music_path), staged, out_path)
         else:
+            cmd = [
+                ffmpeg_path(), "-y", "-v", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                "-c", "copy", "-movflags", "+faststart", str(concat_out),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if proc.returncode != 0 or not concat_out.exists():
+                raise AutoVidError(
+                    f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
+                )
             concat_out.replace(out_path)
         if not out_path.exists():
             raise AutoVidError("render produced no output")
         return out_path
     finally:
-        # keep only the final render; staged fades and per-item clips are
-        # reproducible from the EDL
+        # faded intermediates and staged clips no longer referenced by this
+        # render are reproducible from the EDL; referenced item clips stay so
+        # the next re-render skips their extraction
         for p in staged:
             if p.name.startswith("faded_"):
                 p.unlink(missing_ok=True)
+        keep = {p.resolve() for _, p in pairs}
         for p in out_dir.glob("item_*.mp4"):
-            p.unlink(missing_ok=True)
+            if p.resolve() not in keep:
+                p.unlink(missing_ok=True)
         concat_file.unlink(missing_ok=True)
         concat_out.unlink(missing_ok=True)
 
 
-def _mux_music(video: Path, music: Path, out_path: Path) -> None:
-    """Lay the music over the stitched video: pad if short, fade out 2 s.
+def _render_with_music(
+    concat_file: Path, music: Path, staged: list[Path], out_path: Path
+) -> None:
+    """Concat + music mux in one ffmpeg pass: video stream-copied from the
+    concat demuxer, music padded if short and faded out over the last 2 s.
 
     ``-shortest`` plus infinite audio pad (``apad``) means the video track
     always defines the output length — a short BGM never truncates the cut.
     """
     from .ffmpeg_io.probe import probe
 
-    duration = max(probe(video).duration_s, 0.5)
+    duration = sum(max(probe(p).duration_s, 0.0) for p in staged)
     fade_st = max(duration - 2.0, 0.0)
     cmd = [
         ffmpeg_path(), "-y", "-v", "error",
-        "-i", str(video), "-i", str(music),
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-i", str(music),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy",
         "-af", f"apad,afade=t=out:st={fade_st:.3f}:d=2",
@@ -172,4 +188,6 @@ def _mux_music(video: Path, music: Path, out_path: Path) -> None:
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0 or not out_path.exists():
-        raise AutoVidError(f"music mux failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}")
+        raise AutoVidError(
+            f"render failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
+        )

@@ -81,19 +81,22 @@ class Job:
         self.current = ""
         self.log: list[str] = []
         self.error: str | None = None
+        self.result: dict = {}  # endpoint-specific payload, set when done
         self.started = time.time()
 
     def view(self) -> dict:
         return {
             "id": self.id, "stage": self.stage, "state": self.state,
             "done": self.done, "total": self.total, "current": self.current,
-            "log": self.log[-8:], "error": self.error,
+            "log": self.log[-8:], "error": self.error, "result": self.result,
         }
 
 
 class JobRunner:
     """In-process background jobs. One job at a time — the pipeline is
     inherently sequential per catalog, and stages write the same tables."""
+
+    MAX_JOBS = 50  # long-lived desktop process: don't grow the history forever
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
@@ -107,6 +110,11 @@ class JobRunner:
                 raise HTTPException(409, f"job {running[0].id} ({running[0].stage}) "
                                          "is still running — wait for it first")
             self._jobs[job.id] = job
+            if len(self._jobs) > self.MAX_JOBS:
+                by_age = sorted(self._jobs.values(), key=lambda j: j.started)
+                for old in by_age[: len(self._jobs) - self.MAX_JOBS]:
+                    if old.state != "running":
+                        self._jobs.pop(old.id, None)
         thread = threading.Thread(target=self._wrap, args=(job, target), daemon=True)
         thread.start()
         return job
@@ -140,8 +148,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_settings() -> Settings:
         return holder["settings"]
 
+    conn_cache: dict[str, object] = {}
+
     def conn():
-        return db.connect(holder["settings"].db_path)
+        """One cached connection per database path, reused across requests.
+
+        WAL lets these read-mostly connections run concurrent with the job
+        runner's own per-job write connections; this removes the per-request
+        connect + pragma + init_db churn. Settings changes that repoint
+        db_path simply open a second cached entry.
+        """
+        s = holder["settings"]
+        key = str(Path(s.db_path).resolve())
+        c = conn_cache.get(key)
+        if c is None:
+            c = db.connect(s.db_path)
+            conn_cache[key] = c
+        return c
 
     @app.get("/")
     def index() -> FileResponse:
@@ -171,7 +194,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get("/api/segments")
-    def segments(asset_id: str | None = None, q: str | None = None) -> list[dict]:
+    def segments(
+        asset_id: str | None = None, q: str | None = None,
+        status: str | None = None, limit: int = 1000,
+    ) -> list[dict]:
         c = conn()
         sql = (
             "SELECT s.*, a.original_name FROM segments s JOIN assets a ON a.id = s.asset_id "
@@ -185,7 +211,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pattern = f"%{q.lower()}%"
             sql += " AND (lower(s.description) LIKE ? OR lower(s.tags_json) LIKE ?)"
             args += [pattern, pattern]
-        sql += " ORDER BY s.highlight_score DESC"
+        if status:
+            sql += " AND s.review_status = ?"
+            args.append(status)
+        sql += " ORDER BY s.highlight_score DESC LIMIT ?"
+        args.append(max(int(limit), 1))
         return [dict(r) for r in c.execute(sql, args).fetchall()]
 
     @app.post("/api/segments/{segment_id}/review")
@@ -255,13 +285,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/edls/{edl_id}/render")
     def render(edl_id: str) -> dict:
-        c = conn()
         try:
-            board = load_edl(c, edl_id)
-            out = render_edl(c, current_settings(), board)
+            load_edl(conn(), edl_id)
         except AutoVidError as e:
-            raise HTTPException(409, str(e))
-        return {"edl_id": edl_id, "path": str(out), "duration_s": board.duration_s}
+            raise HTTPException(404, str(e))
+
+        # Renders take minutes (dozens of ffmpeg spawns) — run as a job so the
+        # request returns at once and the browser polls progress. Also keeps
+        # the one-job-at-a-time guard: a render must not interleave with a
+        # pipeline stage writing the same tables.
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            board = load_edl(c, edl_id)
+            job.current = board.name
+            out = render_edl(c, s, board)
+            job.result = {"edl_id": edl_id, "path": str(out),
+                          "duration_s": board.duration_s}
+            job.log.append(f"rendered {out.name}")
+
+        return runner.start("render", {"edl_id": edl_id}, target).view()
 
     @app.get("/renders/{edl_id}/{name}")
     def rendered(edl_id: str, name: str) -> FileResponse:
@@ -374,20 +417,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             targets = [asset_id] if asset_id else [
                 r["id"] for r in pending_assets(c, status_for[stage])]
             job.total = len(targets)
-            for aid in targets:
-                job.current = aid
-                if stage == "sample":
-                    sampling.sample_asset(c, s, aid)
-                elif stage == "analyze":
-                    analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
-                elif stage == "cut":
-                    cut_asset(c, s, aid, decisions=decisions)
-                else:
-                    from .organize import organize_asset
+            try:
+                for aid in targets:
+                    job.current = aid
+                    if stage == "sample":
+                        sample_asset(c, s, aid)
+                    elif stage == "analyze":
+                        analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
+                    elif stage == "cut":
+                        cut_asset(c, s, aid, decisions=decisions)
+                    else:
+                        from .organize import organize_asset
 
-                    organize_asset(c, s, aid)
-                job.done += 1
-                job.log.append(f"{aid}: done")
+                        organize_asset(c, s, aid)
+                    job.done += 1
+                    job.log.append(f"{aid}: done")
+            finally:
+                vlm.close()
+                decisions.close()
 
         return target
 
@@ -410,31 +457,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/music/plan")
     def music_plan(params: MusicPlanParams) -> dict:
-        s = current_settings()
-        c = conn()
         music_file = Path(params.music_path)
         if not music_file.exists():
             raise HTTPException(400, f"music file not found: {params.music_path}")
-        from .music import analyze_music
-        from .planner import plan_music_video
 
-        try:
+        # Librosa analysis + per-section mood calls + render take minutes —
+        # job, not request (same reasoning as the render endpoint).
+        def target(job: Job) -> None:
+            s = current_settings()
+            c = db.connect(s.db_path)
+            from .music import analyze_music
+            from .planner import plan_music_video
+
+            job.current = "analyzing music"
             analysis = analyze_music(music_file)
             decisions = DecisionClient(s, c)
-            board = plan_music_video(
-                c, s, analysis, objective=params.objective, mode=params.mode,
-                style=params.style, name=params.name, decisions=decisions,
-            )
-        except (AutoVidError, ValueError) as e:
-            raise HTTPException(409, str(e))
-        out = {"edl_id": board.id, "items": len(board.items),
-               "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
-        if params.render:
             try:
-                out["render_path"] = str(render_edl(c, s, board))
-            except AutoVidError as e:
-                out["render_error"] = str(e)
-        return out
+                board = plan_music_video(
+                    c, s, analysis, objective=params.objective, mode=params.mode,
+                    style=params.style, name=params.name, decisions=decisions,
+                )
+            finally:
+                decisions.close()
+            out = {"edl_id": board.id, "items": len(board.items),
+                   "duration_s": board.duration_s, "tempo_bpm": analysis.tempo_bpm}
+            job.log.append(f"planned {len(board.items)} cuts @ "
+                           f"{analysis.tempo_bpm:.0f} BPM")
+            if params.render:
+                job.current = "rendering"
+                try:
+                    out["render_path"] = str(render_edl(c, s, board))
+                except AutoVidError as e:
+                    out["render_error"] = str(e)
+            job.result = out
+
+        return runner.start("music-plan", params.model_dump(), target).view()
 
     return app
 

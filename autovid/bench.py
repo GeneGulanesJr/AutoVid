@@ -109,8 +109,11 @@ def _fork_catalog(settings: Settings) -> tuple[Settings, Path]:
     src.backup(dst)
     dst.close()
     src.close()
-    if settings.assets_dir.exists():
-        shutil.copytree(settings.assets_dir, fork_dir / "assets")
+    # The fork starts with an EMPTY assets dir, deliberately: sampling
+    # regenerates grid frames from the (unmoved) original sources, and
+    # thumb/poster rows keep pointing at the ORIGINAL assets dir, which stays
+    # untouched. Copying the old assets tree here was pure waste — potentially
+    # GBs of derived media written and then deleted by the first _reset_derived.
     return settings.model_copy(update={"data_dir": fork_dir}), fork_dir
 
 
@@ -128,6 +131,8 @@ def _reset_derived(conn: sqlite3.Connection, fork: Settings) -> None:
         """
     )
     conn.commit()
+    # Only derived artifacts (grid/dense frames) live in the fork's assets
+    # dir — thumbs stay in the original catalog, so this never orphans a row.
     if fork.assets_dir.exists():
         shutil.rmtree(fork.assets_dir)
 

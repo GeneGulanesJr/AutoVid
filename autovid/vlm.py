@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Any, Literal
 
 import httpx
@@ -89,7 +90,26 @@ class VLMClient:
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
         self._transport = transport  # injectable for tests
+        self._client: httpx.Client | None = None
         self.usage: list[dict[str, int]] = []
+
+    def _http(self) -> httpx.Client:
+        """Pooled client for the VLMClient's lifetime.
+
+        One client (one connection pool) means TCP+TLS setup is paid once per
+        run instead of once per window per attempt.
+        """
+        if self._client is None:
+            self._client = httpx.Client(
+                timeout=self.settings.vlm_timeout_s, transport=self._transport
+            )
+        return self._client
+
+    def close(self) -> None:
+        """Release the pooled connection (idempotent)."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     @property
     def configured(self) -> bool:
@@ -136,10 +156,7 @@ class VLMClient:
         last_error: Exception | None = None
         for attempt in range(self.settings.vlm_max_retries + 1):
             try:
-                with httpx.Client(
-                    timeout=self.settings.vlm_timeout_s, transport=self._transport
-                ) as client:
-                    resp = client.post(url, json=body, headers=headers)
+                resp = self._http().post(url, json=body, headers=headers)
                 resp.raise_for_status()
                 payload = resp.json()
                 usage = payload.get("usage") or {}
@@ -157,4 +174,8 @@ class VLMClient:
             except (httpx.HTTPError, KeyError, IndexError, ValueError, ValidationError) as e:
                 last_error = e
                 logger.warning("VLM call attempt %d failed: %s", attempt + 1, e)
+                if isinstance(e, httpx.HTTPError) and attempt < self.settings.vlm_max_retries:
+                    # 429/5xx/network: back off so retries don't hammer the
+                    # endpoint (parse errors retry at once — a delay can't fix them).
+                    time.sleep(min(2.0 * (2**attempt), 8.0))
         raise VLMUnavailable(f"VLM call failed after retries: {last_error}")

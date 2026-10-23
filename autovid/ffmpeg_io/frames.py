@@ -13,8 +13,12 @@ from pathlib import Path
 
 from ..errors import AutoVidError
 from .bins import ffmpeg_path
+from .scenes import SceneChange, merge_detections, parse_scene_pairs
 
 _PTS_TIME_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
+# showinfo logs one line per kept frame; scoping to those lines keeps the
+# grid timestamps unambiguous when other branches also log pts_time.
+_SHOWINFO_PTS_RE = re.compile(r"Parsed_showinfo[^\n]*?pts_time:(\d+(?:\.\d+)?)")
 
 
 def _run(cmd: list[str]) -> str:
@@ -24,6 +28,23 @@ def _run(cmd: list[str]) -> str:
     return proc.stderr
 
 
+def _seek_args(start_s: float | None, end_s: float | None) -> tuple[list[str], float]:
+    """Input-seek options for an optional ``[start_s, end_s)`` span.
+
+    Input seeking resets ffmpeg's timestamps to ~0, so callers rebase parsed
+    ``pts_time`` values by the returned offset to stay on the source timeline.
+    """
+    if start_s is None or start_s <= 0:
+        return [], 0.0
+    args = ["-ss", f"{start_s:.3f}"]
+    if end_s is not None:
+        span = end_s - start_s
+        if span <= 0:
+            return [], 0.0
+        args += ["-t", f"{span:.3f}"]
+    return args, float(start_s)
+
+
 def extract_periodic_frames(
     source: str | Path,
     out_dir: Path,
@@ -31,12 +52,20 @@ def extract_periodic_frames(
     interval_s: float,
     width: int | None = None,
     prefix: str = "ts",
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> list[tuple[float, Path]]:
     """Extract one frame every ``interval_s``; returns ``[(ts, path)]``.
 
     Timestamps are the frames' true ``pts_time`` values on the source timeline.
     Output files are ``<prefix>_%06d.jpg`` in ``out_dir`` (created if needed).
+    When ``start_s``/``end_s`` are given, only that span is decoded instead of
+    the whole file — essential for per-window extraction, which otherwise
+    re-decodes the full source once per window.
     """
+    seek, offset = _seek_args(start_s, end_s)
+    if start_s is not None and start_s > 0 and not seek:
+        return []  # empty/invalid span
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = out_dir / f"{prefix}_%06d.jpg"
     scale = f",scale={width}:-2" if width else ""
@@ -47,6 +76,7 @@ def extract_periodic_frames(
     try:
         stderr = _run([
             ffmpeg_path(), "-y", "-v", "info",
+            *seek,
             "-i", str(source),
             "-vf", vf,
             "-fps_mode", "vfr",
@@ -57,7 +87,7 @@ def extract_periodic_frames(
             leftover.unlink()
         raise
 
-    pts = [float(m) for m in _PTS_TIME_RE.findall(stderr)]
+    pts = [float(m) + offset for m in _PTS_TIME_RE.findall(stderr)]
     files = sorted(out_dir.glob(f"{prefix}_*.jpg"))
     if len(pts) != len(files):
         for leftover in files:
@@ -66,6 +96,61 @@ def extract_periodic_frames(
             f"frame extraction mismatch: {len(pts)} pts_time entries vs {len(files)} files"
         )
     return list(zip(pts, files))
+
+
+def extract_grid_and_scene_changes(
+    source: str | Path,
+    out_dir: Path,
+    *,
+    interval_s: float,
+    width: int | None = None,
+    prefix: str = "grid",
+    scene_threshold: float = 0.3,
+    min_gap_s: float = 1.0,
+) -> tuple[list[tuple[float, Path]], list[SceneChange]]:
+    """Grid frames AND scene-change detections from a single decode.
+
+    Both branches split off one decoded stream — the grid branch keeps a frame
+    every ``interval_s`` (each branch has its own ``prev_selected_t`` state, so
+    the grid phase is identical to running ``extract_periodic_frames`` alone),
+    while the scene branch evaluates ``gt(scene,T)`` per frame. Merging the two
+    previously separate full-file decode passes halves sampling decode time.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / f"{prefix}_%06d.jpg"
+    scale = f",scale={width}:-2" if width else ""
+    filter_complex = (
+        f"[0:v]split=2[grid][scen];"
+        f"[grid]select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval_s})'"
+        f",showinfo{scale}[gout];"
+        # nullsink (not -f null): a zero-detection scene branch must not fail
+        # the run the way an empty muxer output would.
+        f"[scen]select='gt(scene,{scene_threshold})',metadata=print,nullsink"
+    )
+    try:
+        stderr = _run([
+            ffmpeg_path(), "-y", "-v", "info",
+            "-i", str(source),
+            "-filter_complex", filter_complex,
+            "-map", "[gout]", "-fps_mode", "vfr", str(pattern),
+        ])
+    except AutoVidError:
+        for leftover in out_dir.glob(f"{prefix}_*.jpg"):
+            leftover.unlink()
+        raise
+
+    pts = [float(m) for m in _SHOWINFO_PTS_RE.findall(stderr)]
+    files = sorted(out_dir.glob(f"{prefix}_*.jpg"))
+    if len(pts) != len(files):
+        for leftover in files:
+            leftover.unlink()
+        raise AutoVidError(
+            f"frame extraction mismatch: {len(pts)} pts_time entries vs {len(files)} files"
+        )
+    changes = merge_detections(
+        [SceneChange(ts=t, score=s) for t, s in parse_scene_pairs(stderr)], min_gap_s
+    )
+    return list(zip(pts, files)), changes
 
 
 def frame_at(

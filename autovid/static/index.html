@@ -194,7 +194,7 @@ async function startStage(stage) {
   try { const j = await api(`/api/pipeline/${stage}`, {method:"POST", body:{}}); watch(j.id); }
   catch (e) { $("#statusLine").textContent = e.message; }
 }
-function watch(id) {
+function watch(id, onDone) {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     const j = await api(`/api/jobs/${id}`);
@@ -204,6 +204,7 @@ function watch(id) {
       loadAssets();
       if (j.stage === "ingest") loadSegments();
       $("#statusLine").textContent = `${j.stage}: ${j.state}`;
+      if (onDone) onDone(j);
     }
   }, 1500);
 }
@@ -239,14 +240,13 @@ async function loadSegments() {
     <td>${s.clip_path ? `<a href="/clips/${s.id}" target="_blank">clip</a>` : ""}</td></tr>`).join("");
 }
 async function loadReview() {
-  const all = await api("/api/segments");
-  const pending = all.filter(s => s.review_status === "pending");
+  const pending = await api("/api/segments?status=pending");
   $("#reviewTable tbody").innerHTML = pending.map(s => `<tr>
     <td>${s.start_s.toFixed(1)}–${s.end_s.toFixed(1)}s</td>
     <td>${pill(s.verdict, "warn")}</td>
     <td>${s.decision_confidence == null ? "" : s.decision_confidence.toFixed(2)}</td>
     <td>${s.description || ""}</td>
-    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
+    <td>${s.clip_path ? `<video src="/clips/${s.id}" controls muted preload="none"></video>` : '<span class="dim">no clip yet — rendered on approve+render</span>'}</td>
     <td><div class="row-actions">
       <button class="act" onclick="review(${s.id},'approved')">approve</button>
       <button class="act" onclick="review(${s.id},'rejected')">reject</button>
@@ -256,17 +256,24 @@ async function review(id, status) { await api(`/api/segments/${id}/review?status
 
 // ---- music ----
 async function planMusic() {
-  $("#musicInfo").textContent = "analyzing music, planning, rendering…";
+  $("#musicInfo").textContent = "analyzing music, planning, rendering… (watch Pipeline for progress)";
   try {
-    const out = await api("/api/music/plan", {method:"POST", body:{
+    const j = await api("/api/music/plan", {method:"POST", body:{
       music_path: $("#musicPath").value.trim(), objective: "", mode: $("#mvMode").value,
       style: $("#mvStyle").value, name: "music-cut", render: true}});
-    $("#musicInfo").innerHTML =
-      `${out.items} cuts over ${out.duration_s.toFixed(1)}s @ ${Math.round(out.tempo_bpm)} BPM` +
-      (out.render_path ? ` — <a href="/renders/${out.edl_id}/music-cut.mp4">open render</a>` :
-       out.render_error ? " (render failed: " + out.render_error + ")" : "");
-    if (out.render_path) $("#musicPreview").src = `/renders/${out.edl_id}/music-cut.mp4`;
-    loadEdlList();
+    watch(j.id, (done) => {
+      const out = done.result;
+      if (done.state !== "done" || !out) {
+        $("#musicInfo").textContent = "failed: " + (done.error || "unknown error");
+        return;
+      }
+      $("#musicInfo").innerHTML =
+        `${out.items} cuts over ${out.duration_s.toFixed(1)}s @ ${Math.round(out.tempo_bpm)} BPM` +
+        (out.render_path ? ` — <a href="/renders/${out.edl_id}/music-cut.mp4">open render</a>` :
+         out.render_error ? " (render failed: " + out.render_error + ")" : "");
+      if (out.render_path) $("#musicPreview").src = `/renders/${out.edl_id}/music-cut.mp4`;
+      loadEdlList();
+    });
   } catch (e) { $("#musicInfo").textContent = "failed: " + e.message; }
 }
 
@@ -307,12 +314,19 @@ async function saveEdl() {
 }
 async function renderEdl() {
   await saveEdl();
-  $("#renderInfo").textContent = "rendering…";
+  $("#renderInfo").textContent = "rendering… (watch Pipeline for progress)";
   try {
-    const out = await api(`/api/edls/${EDL.id}/render`, {method:"POST"});
-    const name = EDL.music_path ? `${EDL.name}.mp4` : `${EDL.name}.mp4`;
-    $("#renderInfo").innerHTML = `rendered ${out.duration_s.toFixed(1)}s — <a href="/renders/${EDL.id}/${name}">open</a>`;
-    $("#preview").src = `/renders/${EDL.id}/${name}`;
+    const j = await api(`/api/edls/${EDL.id}/render`, {method:"POST"});
+    watch(j.id, (done) => {
+      const out = done.result;
+      if (done.state !== "done" || !out || !out.path) {
+        $("#renderInfo").textContent = "render failed: " + (done.error || "unknown error");
+        return;
+      }
+      const name = `${EDL.name}.mp4`;
+      $("#renderInfo").innerHTML = `rendered ${(out.duration_s || 0).toFixed(1)}s — <a href="/renders/${EDL.id}/${name}">open</a>`;
+      $("#preview").src = `/renders/${EDL.id}/${name}`;
+    });
   } catch (e) { $("#renderInfo").textContent = "render failed: " + e.message; }
 }
 

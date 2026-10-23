@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import io
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
@@ -21,7 +22,21 @@ def b64_jpeg(
     Frames are downscaled to ``max_width`` (never upscaled) before encoding —
     decision and VLM calls do not need full-resolution pixels, and payload size
     dominates cloud call cost.
+
+    Results are cached per (path, mtime): the same immutable frame is encoded
+    repeatedly across phases (continuity pairs, boundary probes, scene
+    evidence) and the encode is deterministic. Bounded — payloads are large.
     """
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError as e:
+        raise AutoVidError(f"cannot encode frame {path}: {e}") from e
+    return _b64_jpeg_cached(str(p), st.st_mtime_ns, max_width, quality)
+
+
+@lru_cache(maxsize=128)
+def _b64_jpeg_cached(path: str, mtime_ns: int, max_width: int, quality: int) -> str:
     try:
         with Image.open(path) as img:
             img = img.convert("RGB")

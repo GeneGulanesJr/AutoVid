@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,17 @@ def test_edl_create_get_put(client: TestClient) -> None:
     assert [i["clip_id"] for i in updated["items"]] == list(reversed(seg_ids))
 
 
+def _await_job(client: TestClient, job: dict, timeout_s: float = 120.0) -> dict:
+    """Poll a background job to completion (render/music run as jobs now)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        j = client.get(f"/api/jobs/{job['id']}").json()
+        if j["state"] != "running":
+            return j
+        time.sleep(0.2)
+    raise AssertionError(f"job {job['id']} did not finish in {timeout_s}s")
+
+
 def test_render_via_api(client: TestClient) -> None:
     seg_ids = [s["id"] for s in client.get("/api/segments").json()]
     board = EDL(
@@ -128,7 +140,9 @@ def test_render_via_api(client: TestClient) -> None:
         ],
     )
     edl_id = client.post("/api/edls", json=board.model_dump()).json()["id"]
-    out = client.post(f"/api/edls/{edl_id}/render").json()
+    job = _await_job(client, client.post(f"/api/edls/{edl_id}/render").json())
+    assert job["state"] == "done", job["error"]
+    out = job["result"]
     assert Path(out["path"]).exists()
     assert abs(out["duration_s"] - 9.0) < 1.5
 
