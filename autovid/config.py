@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     # JSON answer, so the budget must cover both or the answer truncates.
     vlm_max_tokens: int = 4096
 
+    # Speech-to-text (faster-whisper, local CPU). d1-omni only classifies audio, it can't transcribe.
+    # `small` garbles Tagalog/Taglish; full large-v3 beats large-v3-turbo on it (turbo is the faster fallback).
+    whisper_model: str = "large-v3"
+    # whispercpp = whisper.cpp + Vulkan (AMD/Intel/NVIDIA GPUs); faster-whisper = CPU or NVIDIA CUDA only;
+    # auto = whispercpp when its executable exists under whispercpp_dir, else faster-whisper.
+    whisper_backend: str = "auto"
+    whispercpp_dir: Path = Path.home() / ".whisper-vulkan"  # bin/whisper-cli.exe, models/ggml-<model>.bin
+    # faster-whisper only: auto = CUDA when ctranslate2 sees an NVIDIA GPU, else CPU.
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
+
     # Baseline sampling policy (the decision layer may override per region).
     grid_interval_s: float = 2.0
     thumb_interval_s: float = 30.0
@@ -50,6 +61,10 @@ class Settings(BaseSettings):
     # footage at once. The decision layer then merges/splits these windows
     # into logical scenes (phases 2–4 in refine.py).
     coarse_window_s: float = 60.0
+    # Clips up to fine_window_max_duration_s are analyzed in fine_window_s windows instead (when that is
+    # shorter): a dish or a reaction can then be placed to ~8 s, not to a minute. Long footage keeps coarse.
+    fine_window_s: float = 8.0
+    fine_window_max_duration_s: float = 600.0
 
     @property
     def db_path(self) -> Path:

@@ -137,9 +137,12 @@ def analyze_asset(
         source = Path(asset["path"])
         if not source.exists():
             raise AutoVidError(f"Source file missing: {source}")
-        windows = build_windows(
-            float(asset["duration_s"]), coarse_window_s=settings.coarse_window_s
-        )
+        duration = float(asset["duration_s"])
+        window_s = (settings.coarse_window_s if duration > settings.fine_window_max_duration_s
+                    else min(settings.coarse_window_s, settings.fine_window_s))
+        windows = build_windows(duration, coarse_window_s=window_s)
+        conn.execute("DELETE FROM analyses WHERE asset_id = ?", (asset_id,))  # replace, never duplicate
+        conn.commit()
 
         previous_description: str | None = None
         for start, end in windows:
@@ -251,6 +254,11 @@ def analyze_asset(
             )
             conn.commit()
 
+        if vlm.configured and result.windows and result.unparsed == result.windows:
+            # A key is set, so "unavailable" is a real failure (bad model/parameter/key), not the
+            # intentional cold start: do not mark the asset analyzed with nothing in it.
+            raise AutoVidError(f"every VLM call failed ({result.windows} windows): "
+                               f"{result.notes[0] if result.notes else 'no detail'}")
         conn.execute(
             "UPDATE assets SET status = 'analyzed', error = NULL, updated_at = datetime('now') "
             "WHERE id = ?",

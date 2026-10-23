@@ -39,6 +39,7 @@ from .errors import AutoVidError
 from .ffmpeg_io.clips import clip_filename, extract_clip
 from .ffmpeg_io.frames import frame_at
 from .ingest import get_asset
+from .kinds import classify
 from .media import b64_jpeg
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,7 @@ def catalog_scenes(
     source: Path,
     scenes: list[dict],
     decisions: DecisionClient,
+    ignore_highlight: bool = False,
 ) -> tuple[list[int], int, int, int]:
     """Phase 5 — one candidate segment per highlight scene; returns
     (segment ids, accepted, flagged, rejected)."""
@@ -307,7 +309,7 @@ def catalog_scenes(
             ids.append(cur.lastrowid)
             flagged += 1
             continue
-        if scene["highlight"] < HIGHLIGHT_THRESHOLD:
+        if scene["highlight"] < HIGHLIGHT_THRESHOLD and not ignore_highlight:
             continue
 
         summary = json.dumps({
@@ -398,8 +400,10 @@ def cut_asset(
         result.boundaries_verified = stats["verified"]
         result.boundaries_refined = stats["refined"]
 
+        # Talking footage scores low visually but its value is in what is said: don't gate it on looks.
         ids, accepted, flagged, rejected = catalog_scenes(
-            conn, settings, asset_id, source, scenes, decisions
+            conn, settings, asset_id, source, scenes, decisions,
+            ignore_highlight="speech" in classify(conn).get(asset_id, set()),
         )
         result.segments_accepted = accepted
         result.segments_flagged = flagged

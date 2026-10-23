@@ -67,3 +67,41 @@ against the fixed-interval baseline.
 
 Run tests: `.venv/Scripts/python -m pytest` (real ffmpeg on synthetic clips,
 mocked model calls — no network, no API key needed).
+
+## Speech-to-text (transcribe + script stages)
+
+`autovid transcribe --all` fills the `transcripts` table; `autovid script "<objective>" --duration 60`
+then has the LLM pick the spoken lines that tell the story (speech-only EDL, render as usual).
+
+Backends (`AUTOVID_WHISPER_BACKEND`, default `auto`):
+
+- **whispercpp** (AMD/Intel/NVIDIA GPU via Vulkan). Put a Windows Vulkan build of whisper.cpp at
+  `~/.whisper-vulkan/bin/whisper-cli.exe` (e.g. `whisper-*-windows-vulkan-x64.zip` from
+  lemonade-sdk/whisper.cpp-rocm releases), plus `models/ggml-large-v3.bin`
+  (huggingface.co/ggerganov/whisper.cpp) and `models/ggml-silero-v5.1.2.bin`
+  (huggingface.co/ggml-org/whisper-vad). Override the folder with `AUTOVID_WHISPERCPP_DIR`.
+  A warning is logged if whisper.cpp ran on the CPU instead of the GPU.
+- **faster-whisper** (CPU, or NVIDIA CUDA). Used when the whisper.cpp executable is absent.
+
+## One command: footage folder → story
+
+```
+autovid run "C:\path\to\footage" --objective "a food vlog: a day at the mall, then breakfast"
+```
+
+Runs ingest → sample → transcribe → analyze, then (with `--objective`) writes the story, lints it and renders a
+preview. The catalog lives in `catalog/<folder name>` (override with `--data-dir`); re-running only does what is
+missing, so you can add footage and run it again (`--force` redoes transcribe and analyze). It first makes one real
+call to your VLM, so a bad key, base URL, model or parameter stops the run immediately with the server's own reason
+(the Settings page has the same **Test connection** button).
+
+- `autovid check [edl]` lints an EDL: footage that plays twice, food shots that look the same, tiny clips, food
+  share of the runtime, a timelapse used too much, mixed formats. Exits non-zero on a defect. `script` and `run`
+  print it automatically.
+- `autovid analyze --force` re-analyzes assets already analyzed (replacing, never duplicating, their rows).
+- Clips up to 10 minutes are analyzed in 8 s windows (`AUTOVID_FINE_WINDOW_S`), so a dish or reaction is placed to
+  seconds, not a minute; longer footage keeps the 60 s windows.
+- Each clip is tagged from its metadata and transcript: `speech` (skips the visual highlight gate in `cut`),
+  `timelapse` (at most one food shot), `other_camera` and `no_audio` (the renderer conforms them so clips from
+  different cameras join cleanly).
+- The desktop app has the same stages (Transcribe, Story) and settings.

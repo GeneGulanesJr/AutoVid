@@ -144,3 +144,64 @@ def test_clip_serving(client: TestClient) -> None:
     r = client.get(f"/clips/{seg['id']}")
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("video/mp4")
+
+
+def test_vlm_test_endpoint_reports_the_servers_reason(client: TestClient, monkeypatch) -> None:
+    from autovid.vlm import VLMUnavailable
+
+    monkeypatch.setattr(VLMClient, "ping", lambda self: None)
+    ok = client.post("/api/vlm/test", json={"api_key": "k", "model": "m"})
+    assert ok.status_code == 200 and ok.json() == {"ok": True, "model": "m"}
+
+    def refuse(self):
+        raise VLMUnavailable("VLM check failed: 400 — `temperature` is deprecated for this model.")
+
+    monkeypatch.setattr(VLMClient, "ping", refuse)
+    bad = client.post("/api/vlm/test", json={})
+    assert bad.status_code == 502 and "temperature" in bad.json()["detail"]
+
+
+def test_script_endpoint_needs_transcripts_then_returns_story_and_findings(
+        client: TestClient, settings: Settings, monkeypatch) -> None:
+    r = client.post("/api/script", json={"objective": "a day out"})
+    assert r.status_code == 409 and "transcribe" in r.json()["detail"]
+
+    conn = db.connect(settings.db_path)
+    aid = conn.execute("SELECT id FROM assets").fetchone()["id"]
+    line = conn.execute("INSERT INTO transcripts (asset_id, start_s, end_s, text) VALUES (?, 1, 3, 'Tara na!')",
+                        (aid,)).lastrowid
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(VLMClient, "ask_json", lambda self, system, user: {
+        "title": "Day out", "beats": [{"label": "intro", "order": [f"L{line}"]}]})
+    r = client.post("/api/script", json={"objective": "a day out", "name": "t"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "Day out" and body["items"] == 1
+    assert {f["name"] for f in body["findings"]} >= {"length", "replay"}
+
+
+def test_transcribe_stage_runs_for_assets_with_audio(client: TestClient, settings: Settings, monkeypatch) -> None:
+    import time
+
+    import autovid.transcribe as tr
+
+    conn = db.connect(settings.db_path)
+    conn.execute("UPDATE assets SET has_audio = 1")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(tr, "load_model", lambda s: None)
+    monkeypatch.setattr(tr, "transcribe_asset", lambda c, s, aid, model=None: 3)
+    job = client.post("/api/pipeline/transcribe", json={}).json()
+    for _ in range(50):
+        view = client.get(f"/api/jobs/{job['id']}").json()
+        if view["state"] != "running":
+            break
+        time.sleep(0.1)
+    assert view["state"] == "done" and any("3 utterances" in line for line in view["log"])
+
+
+def test_settings_page_offers_the_whisper_and_window_options(client: TestClient) -> None:
+    groups = {g["group"]: [f["key"] for f in g["fields"]] for g in client.get("/api/settings").json()["groups"]}
+    assert "AUTOVID_WHISPER_BACKEND" in groups["Speech-to-text (transcribe + story)"]
+    assert "AUTOVID_FINE_WINDOW_S" in groups["Pipeline"]

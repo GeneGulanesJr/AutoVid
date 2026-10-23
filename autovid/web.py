@@ -50,6 +50,18 @@ class SettingsUpdate(BaseModel):
     values: dict[str, str]
 
 
+class ModelsRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""   # used by /api/vlm/test only
+
+
+class ScriptParams(BaseModel):
+    objective: str
+    name: str = "script-cut"
+    render: bool = False
+
+
 class IngestParams(BaseModel):
     folder: str
     recursive: bool = True
@@ -292,6 +304,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         holder["settings"] = get_settings()
         return {"saved": sorted(update.values), "restart_free": True}
 
+    @app.post("/api/models")
+    def list_vlm_models(req: ModelsRequest) -> dict:
+        from .vlm import VLMUnavailable, list_models
+
+        s = current_settings()
+        # Form values win over saved ones so the list works before saving.
+        try:
+            return {"models": list_models(req.base_url or s.vlm_base_url,
+                                          req.api_key or s.vlm_api_key)}
+        except VLMUnavailable as e:
+            raise HTTPException(502, str(e)) from e
+
+    @app.post("/api/vlm/test")
+    def test_vlm(req: ModelsRequest) -> dict:
+        """One real call with the form's (or saved) key / base URL / model: shows the server's own reason."""
+        from .vlm import VLMUnavailable
+
+        s = current_settings().model_copy(update={k: v for k, v in (
+            ("vlm_base_url", req.base_url), ("vlm_api_key", req.api_key), ("vlm_model", req.model)) if v})
+        try:
+            VLMClient(s).ping()
+        except VLMUnavailable as e:
+            raise HTTPException(502, str(e)) from e
+        return {"ok": True, "model": s.vlm_model}
+
+    @app.post("/api/script")
+    def write_story(params: ScriptParams) -> dict:
+        """Order the spoken lines and food shots into a story (needs transcripts) and lint the result."""
+        from dataclasses import asdict
+
+        from .check import check_edl
+        from .script import write_script
+
+        s = current_settings()
+        c = conn()
+        try:
+            board, title = write_script(c, VLMClient(s), objective=params.objective, name=params.name)
+        except (AutoVidError, ValueError) as e:
+            raise HTTPException(409, str(e)) from e
+        out = {"edl_id": board.id, "title": title, "items": len(board.items), "duration_s": board.duration_s,
+               "findings": [asdict(f) for f in check_edl(c, board)]}
+        if params.render:
+            try:
+                out["render_path"] = str(render_edl(c, s, board))
+            except AutoVidError as e:
+                out["render_error"] = str(e)
+        return out
+
     # -- first-run setup checks -----------------------------------------------
 
     @app.get("/api/setup")
@@ -371,8 +431,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             status_for = {"sample": "ingested", "analyze": "sampled",
                           "cut": "analyzed", "organize": "cut"}
-            targets = [asset_id] if asset_id else [
-                r["id"] for r in pending_assets(c, status_for[stage])]
+            whisper = None
+            if stage == "transcribe":  # not status-driven: every asset with audio not yet transcribed
+                from .transcribe import load_model, transcribe_asset
+
+                targets = [asset_id] if asset_id else [
+                    r["id"] for r in c.execute("SELECT id FROM assets WHERE has_audio = 1 ORDER BY original_name")
+                    if not db.job_done(c, r["id"], "transcribe")]
+                whisper = load_model(s)
+            else:
+                targets = [asset_id] if asset_id else [
+                    r["id"] for r in pending_assets(c, status_for[stage])]
+            if stage == "analyze" and vlm.configured:
+                vlm.ping()  # a bad key / model / parameter stops the job here, with the server's reason
             job.total = len(targets)
             for aid in targets:
                 job.current = aid
@@ -382,6 +453,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     analyze_asset(c, s, aid, vlm=vlm, decisions=decisions)
                 elif stage == "cut":
                     cut_asset(c, s, aid, decisions=decisions)
+                elif stage == "transcribe":
+                    job.log.append(f"{aid}: {transcribe_asset(c, s, aid, model=whisper)} utterances")
                 else:
                     from .organize import organize_asset
 
@@ -393,9 +466,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/pipeline/{stage}")
     def start_stage(stage: str, params: StageParams) -> dict:
-        if stage not in ("sample", "analyze", "cut", "organize"):
-            raise HTTPException(400, "stage must be sample | analyze | cut | organize")
-        if stage != "sample" and params.asset_id is None:
+        if stage not in ("sample", "transcribe", "analyze", "cut", "organize"):
+            raise HTTPException(400, "stage must be sample | transcribe | analyze | cut | organize")
+        if stage not in ("sample", "transcribe") and params.asset_id is None:
             count = conn().execute(
                 "SELECT COUNT(*) AS n FROM assets WHERE status = ?",
                 ({"sample": "ingested", "analyze": "sampled",

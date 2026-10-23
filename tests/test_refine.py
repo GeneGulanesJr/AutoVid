@@ -343,3 +343,23 @@ def test_cold_start_without_vlm_rescues_via_review(settings: Settings, tmp_path:
     assert probe(out).duration_s > 1.0
     # lazily extracted per-item clips are staged for the render, then cleaned up
     assert list(out.parent.glob("item_*.mp4")) == []
+
+
+def test_speech_driven_assets_skip_the_visual_highlight_gate(settings, tmp_path, monkeypatch):
+    """Talking footage scores low visually; its low-highlight scenes must still reach the decision layer."""
+    import autovid.refine as refine
+    from types import SimpleNamespace
+
+    conn = db.connect(tmp_path / "g.db")
+    conn.execute("INSERT INTO assets (id, sha256, path, original_path, original_name, duration_s)"
+                 " VALUES ('a', 's', 'p', 'p', 'a.mp4', 10)")
+    scene = {"start": 0.0, "end": 5.0, "description": "two friends chatting", "extra_windows": 0,
+             "windows": [{"data": {}, "summary": {}}], "highlight": 0.1, "tags": []}
+    monkeypatch.setattr(refine, "_scene_evidence", lambda *a, **k: ["frame"])
+    decisions = SimpleNamespace(decide_segment=lambda *a, **k: SimpleNamespace(
+        verdict="accept", confidence=0.8, quality_level="ok"))
+
+    refine.catalog_scenes(conn, settings, "a", Path("p"), [scene], decisions)
+    assert conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0] == 0          # dropped by the gate
+    refine.catalog_scenes(conn, settings, "a", Path("p"), [scene], decisions, ignore_highlight=True)
+    assert conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0] == 1          # kept for speech assets

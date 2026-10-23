@@ -158,3 +158,40 @@ def test_analyze_flags_high_uncertainty(settings: Settings, sampled, monkeypatch
     )
     result = analyze_asset(conn, coarse, asset_id, vlm=vlm, decisions=decisions)
     assert result.flagged == 3
+
+
+def test_analyze_fails_the_asset_when_a_configured_vlm_fails_every_window(settings: Settings, sampled, monkeypatch) -> None:
+    from autovid.errors import AutoVidError
+
+    conn, coarse, asset_id = sampled
+    keyed = settings.model_copy(update={"vlm_api_key": "k"})
+    decisions = DecisionClient(settings.model_copy(update={"decision_mode": "heuristic"}), conn)
+    vlm = VLMClient(keyed)
+
+    def broken(*, frames, previous_description=None, window_hint=""):
+        raise VLMUnavailable("400: `temperature` is deprecated for this model.")
+
+    monkeypatch.setattr(vlm, "describe_window", broken)
+    with pytest.raises(AutoVidError, match="every VLM call failed.*temperature"):
+        analyze_asset(conn, coarse, asset_id, vlm=vlm, decisions=decisions)
+    row = conn.execute("SELECT status, error FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    assert row["status"] == "error" and "temperature" in row["error"]   # not "analyzed" with nothing in it
+
+
+def test_reanalysis_replaces_rows_instead_of_duplicating(settings: Settings, sampled, monkeypatch) -> None:
+    conn, coarse, asset_id = sampled
+    decisions = DecisionClient(settings.model_copy(update={"decision_mode": "heuristic"}), conn)
+    vlm = VLMClient(settings)
+    monkeypatch.setattr(vlm, "describe_window", lambda **kw: _analysis())
+    first = analyze_asset(conn, coarse, asset_id, vlm=vlm, decisions=decisions)
+    analyze_asset(conn, coarse, asset_id, vlm=vlm, decisions=decisions)
+    assert conn.execute("SELECT COUNT(*) FROM analyses WHERE asset_id = ?", (asset_id,)).fetchone()[0] == first.windows
+
+
+def test_short_clips_get_fine_windows_by_default(settings: Settings, sampled, monkeypatch) -> None:
+    conn, _, asset_id = sampled            # a 9 s clip; default coarse_window_s is 60
+    decisions = DecisionClient(settings.model_copy(update={"decision_mode": "heuristic"}), conn)
+    vlm = VLMClient(settings)
+    monkeypatch.setattr(vlm, "describe_window", lambda **kw: _analysis())
+    result = analyze_asset(conn, settings, asset_id, vlm=vlm, decisions=decisions)
+    assert result.windows == 2             # 8 s fine windows: [0,8) and the 1 s remainder, not one 60 s window
