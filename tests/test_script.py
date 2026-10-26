@@ -10,7 +10,7 @@ import pytest
 from autovid import db
 from autovid.config import Settings
 from autovid.errors import AutoVidError
-from autovid.script import write_script
+from autovid.script import _SPINE_SYSTEM, write_script
 from autovid.transcribe import load_model, transcribe_asset
 
 
@@ -31,11 +31,14 @@ class FakeWhisper:
 class FakeLLM:
     configured = True
 
-    def __init__(self, *replies):
+    def __init__(self, *replies, spine=None):
         self.replies = list(replies)
+        self.spine = spine or {}      # the story-plan call; empty plan = no story rules
         self.prompts = []
 
     def ask_json(self, system, user):
+        if system is _SPINE_SYSTEM:
+            return self.spine
         self.prompts.append(user)
         return self.replies.pop(0)
 
@@ -328,3 +331,93 @@ def test_a_timelapse_contributes_at_most_its_best_shot_and_is_labelled_for_the_j
     assert any("TIMELAPSE" in p.get("text", "") for p in llm.prompts[0])        # the judge was told
     food = [i for i in board.items if "[food]" in i.note]
     assert sorted(i.note.split("[food] ")[1] for i in food) == ["noodles", "pancakes"]
+
+
+def _story_fixture(conn):
+    why = _line(conn, "a_0", 1.0, 2.0, "Birthday ko kasi")
+    sayang = _line(conn, "a_0", 10.0, 11.0, "Sayang, light breakfast lang")
+    close = _line(conn, "a_1", 1.0, 2.0, "Ang sarap talaga")
+    food = _window(conn, "a_1", 10.0, 18.0, "birthday pancakes", ["pancakes"])
+    spine = {"premise": "a birthday breakfast", "hook": [f"S{food}"], "ending": [f"L{close}"],
+             "threads": [{"name": "birthday", "refs": [f"S{food}", f"L{why}", f"L{sayang}"]}]}
+    return why, sayang, close, food, spine
+
+
+def _cut(title, order):
+    return {"title": title, "beats": [{"label": "b", "order": order}]}
+
+
+def test_a_thread_told_by_halves_is_reasked_and_the_whole_thread_wins(conn):
+    why, sayang, close, food, spine = _story_fixture(conn)
+    halves = _cut("halves", [f"S{food}", f"L{sayang}", f"L{close}"])        # the reason for the hook is missing
+    whole = _cut("whole", [f"S{food}", f"L{why}", f"L{sayang}", f"L{close}"])
+    llm = FakeLLM(halves, whole, spine=spine)
+    board, title = write_script(conn, llm, objective="o")
+    assert title == "whole"
+    assert "told by halves" in llm.prompts[1] and f"add L{why}" in llm.prompts[1]
+    assert "Birthday ko kasi" in " ".join(i.note for i in board.items)
+    assert board.story["premise"] == "a birthday breakfast"                 # the plan is saved with the cut
+
+
+def test_a_cut_that_ends_on_setup_is_reasked(conn):
+    why, sayang, close, food, spine = _story_fixture(conn)
+    wrong = _cut("wrong", [f"S{food}", f"L{close}", f"L{why}", f"L{sayang}"])  # ends on the sayang line
+    right = _cut("right", [f"S{food}", f"L{why}", f"L{sayang}", f"L{close}"])
+    llm = FakeLLM(wrong, right, spine=spine)
+    _, title = write_script(conn, llm, objective="o")
+    assert title == "right" and f"end on one of L{close}" in llm.prompts[1]
+
+
+def test_a_story_retry_that_does_not_improve_is_ignored(conn):
+    why, sayang, close, food, spine = _story_fixture(conn)
+    first = _cut("first", [f"S{food}", f"L{sayang}", f"L{close}"])
+    second = _cut("second", [f"S{food}", f"L{sayang}", f"L{close}"])        # same problem again
+    llm = FakeLLM(first, second, spine=spine)
+    _, title = write_script(conn, llm, objective="o")
+    assert title == "first" and len(llm.prompts) == 2
+
+
+def test_a_cut_that_keeps_the_plan_costs_no_extra_story_call(conn):
+    why, sayang, close, food, spine = _story_fixture(conn)
+    llm = FakeLLM(_cut("ok", [f"S{food}", f"L{why}", f"L{sayang}", f"L{close}"]), spine=spine)
+    write_script(conn, llm, objective="o")
+    assert len(llm.prompts) == 1 and "Story plan" in llm.prompts[0]
+
+
+def test_a_failed_plan_call_means_no_story_rules_not_a_failed_run(conn):
+    from autovid.vlm import VLMUnavailable
+
+    class NoPlan(FakeLLM):
+        def ask_json(self, system, user):
+            if system is _SPINE_SYSTEM:
+                raise VLMUnavailable("down")
+            return super().ask_json(system, user)
+
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    board, title = write_script(conn, NoPlan(_cut("t", [f"L{a}"])), objective="o")
+    assert title == "t" and board.items and board.story == {"premise": "", "hook": [], "threads": [], "ending": []}
+
+
+def test_fingerprint_and_judge_frames_work_on_a_real_video(conn, tmp_path):
+    """frame_at returns (ts, path); both script.py callers once treated it as a path and failed silently."""
+    import subprocess
+
+    from autovid.ffmpeg_io.bins import ffmpeg_path
+    from autovid.script import _fingerprint, _pick_best_shots
+
+    mp4 = tmp_path / "real.mp4"
+    subprocess.run([ffmpeg_path(), "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)], check=True)
+    assert isinstance(_fingerprint(str(mp4), 1.0), int)
+
+    shot = lambda i: {"id": i, "asset_id": "a", "name": "real.mp4", "path": str(mp4), "start": 0.0, "end": 3.0,
+                      "foods": ["x"], "quality": 0.5, "timelapse": False}
+
+    class Eye(FakeLLM):
+        def ask_json(self, system, user):
+            self.saw_image = any(p.get("type") == "image_url" for p in user)
+            return {"dishes": [{"dish": "x", "best": 1}]}
+
+    llm = Eye()
+    assert _pick_best_shots(llm, {1: shot(1), 2: shot(2)}) == {1}
+    assert llm.saw_image                                            # the judge really got the frames

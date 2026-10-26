@@ -4,7 +4,9 @@ Output is an ordered EDL: the spoken lines and food shots, in story order. No
 length target (the story decides) and no compositing (overlays, trims, music
 belong to the editing stage). An LLM reads the noisy transcript and the scene
 log in capture order, tells it as a small story that is mostly about the food,
-and picks the lines and shots. Code then guarantees:
+and picks the lines and shots. A first call plans the story (premise, hook, threads that
+need both halves, ending); the cut is checked against that plan and re-asked once if it
+opens or ends wrongly or tells a thread by halves. Code then guarantees:
 
 - each dish is shown once, from its single best shot (Haiku looks at the candidate
   frames and judges; no second angle or moment of the same dish), and
@@ -87,6 +89,37 @@ class Script(BaseModel):
     beats: list[Beat]
 
 
+_SPINE_SYSTEM = """You plan the story of a vlog before it is cut. You get speech-to-text of raw \
+footage (often Taglish; some lines are mis-heard) plus scene descriptions, in capture order. \
+Spoken lines are marked L<id>, food shots S<id>. Do not cut anything yet; write the plan:
+
+- premise: one sentence: what this video is about and why it is worth watching.
+- hook: up to 3 ids of the most striking moments to open on.
+- threads: at most 4, the ones a viewer who was not there would be lost without: a remark and \
+the reason for it, a plan and what came of it, a joke and its punchline, a dish and the story \
+behind it. refs = only the few ids that are indispensable to it (usually 2 to 4), setup and \
+payoff together; leave out chatter, repeats and garbled lines. Only threads whose pieces really \
+are in the log.
+- ending: up to 3 ids that can close the video as a payoff (the tasting, a reaction, the \
+verdict, a line that resolves the story), never a line that only sets something up.
+
+Pick by id only; never invent ids. Reply with JSON only: \
+{"premise": str, "hook": ["S4"], "threads": [{"name": str, "refs": ["L12", "S40"]}], "ending": ["L90"]}"""
+
+
+class Thread(BaseModel):
+    name: str = ""
+    refs: list[str] = Field(default_factory=list)
+
+
+class Spine(BaseModel):
+    """The story plan the cut is checked against (all-empty = no rules, e.g. the plan call failed)."""
+    premise: str = ""
+    hook: list[str] = Field(default_factory=list)
+    threads: list[Thread] = Field(default_factory=list)
+    ending: list[str] = Field(default_factory=list)
+
+
 Fingerprint = Callable[[str, float], "int | None"]
 
 
@@ -98,7 +131,8 @@ def _fingerprint(path: str, ts: float) -> int | None:
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            img = Image.open(frame_at(path, ts, Path(tmp) / "f.jpg", width=96)).convert("L").resize((9, 8))
+            _, frame = frame_at(path, ts, Path(tmp) / "f.jpg", width=96)
+            img = Image.open(frame).convert("L").resize((9, 8))
             px = list(img.getdata())
     except Exception as e:  # noqa: BLE001 — unreadable frame: treat as "not a repeat"
         logger.debug("no fingerprint for %s@%.1f: %s", path, ts, e)
@@ -182,12 +216,13 @@ def _pick_best_shots(vlm: VLMClient, shots: dict[int, dict]) -> set[int]:
                                                   f"{s['name']} @{_fmt_clock(s['start'])}"
                                                   f"{'; TIMELAPSE' if s['timelapse'] else ''})"})
             try:
-                frame = frame_at(s["path"], (s["start"] + s["end"]) / 2, Path(tmp) / f"{s['id']}.jpg", width=512)
+                _, frame = frame_at(s["path"], (s["start"] + s["end"]) / 2, Path(tmp) / f"{s['id']}.jpg", width=512)
                 parts.append({"type": "image_url", "image_url": {"url": data_uri(b64_jpeg(frame, max_width=512))}})
             except Exception as e:  # noqa: BLE001 — judge from the listing alone
                 logger.warning("no frame for shot S%d: %s", s["id"], e)
     try:
-        best = {int(d["best"]) for d in vlm.ask_json(_JUDGE_SYSTEM, parts).get("dishes", [])} & set(shots)
+        # the model answers "S64" as often as 64
+        best = {int(str(d["best"]).lstrip("Ss")) for d in vlm.ask_json(_JUDGE_SYSTEM, parts).get("dishes", [])} & set(shots)
     except (VLMUnavailable, KeyError, TypeError, ValueError) as e:
         logger.warning("dish judge failed (%s) — keeping every food shot", e)
         best = set()
@@ -204,6 +239,62 @@ def _ask(vlm: VLMClient, footage: str) -> Script:
         return Script.model_validate(vlm.ask_json(_SYSTEM, footage))
     except ValidationError as e:
         raise VLMUnavailable(f"script reply had the wrong shape: {e}") from e
+
+
+def _reask(vlm: VLMClient, prompt: str) -> Script | None:
+    """A second opinion on a cut already in hand: a malformed reply keeps the first cut."""
+    try:
+        return _ask(vlm, prompt)
+    except VLMUnavailable as e:
+        logger.warning("re-ask failed (%s) — keeping the first cut", e)
+        return None
+
+
+def _plan(vlm: VLMClient, prompt: str) -> Spine:
+    """The story plan; a failed or malformed plan means no story rules, never a failed run."""
+    try:
+        return Spine.model_validate(vlm.ask_json(_SPINE_SYSTEM, prompt))
+    except (VLMUnavailable, ValidationError) as e:
+        logger.warning("story plan failed (%s) — cutting without story rules", e)
+        return Spine()
+
+
+def _plan_text(spine: Spine) -> str:
+    """The plan as extra prompt lines for the story call."""
+    if not (spine.hook or spine.threads or spine.ending):
+        return ""
+    out = ["\n\nStory plan (follow it):", f"- premise: {spine.premise}"]
+    if spine.hook:
+        out.append(f"- open on one of: {', '.join(spine.hook)}")
+    if spine.ending:
+        out.append(f"- end on one of: {', '.join(spine.ending)}")
+    out += [f"- thread \"{t.name}\" is all or nothing, keep every one of {', '.join(t.refs)} or none"
+            for t in spine.threads if len(t.refs) > 1]
+    return "\n".join(out)
+
+
+def _story_problems(spine: Spine, script: Script, lines: dict[int, dict], shots: dict[int, dict]) -> list[str]:
+    """Where the cut breaks the plan: wrong opening or ending, a thread told by halves."""
+    def valid(refs: list[str]) -> list[str]:
+        refs = [r.strip().upper() for r in refs]
+        return [r for r in refs if len(r) > 1 and r[1:].isdigit()
+                and int(r[1:]) in (lines if r[0] == "L" else shots if r[0] == "S" else {})]
+
+    picks = [("L" if kind == "line" else "S") + str(r["id"]) for _, kind, r in _picked(script, lines, shots)]
+    if not picks:
+        return []
+    out = []
+    if (hook := valid(spine.hook)) and picks[0] not in hook:
+        out.append(f"open on one of {', '.join(hook)}, not {picks[0]}")
+    if (end := valid(spine.ending)) and picks[-1] not in end:
+        out.append(f"end on one of {', '.join(end)}, not {picks[-1]}")
+    have = set(picks) | {f"S{i}" for i in shots}      # a skipped food shot is added back later anyway
+    for t in spine.threads:
+        refs = valid(t.refs)
+        missing = [r for r in refs if r not in have]
+        if missing and len(missing) < len(refs):
+            out.append(f"thread \"{t.name}\" is told by halves: add {', '.join(missing)}, or remove the rest of it")
+    return out
 
 
 def _picked(script: Script, lines: dict[int, dict], shots: dict[int, dict]) -> list[tuple[str, str, dict]]:
@@ -376,22 +467,33 @@ def write_script(
         footage, lines, shots = _source_prompt(conn, keep=best)
     assets = {a["id"]: a for a in conn.execute("SELECT id, original_name, duration_s FROM assets")}
     prompt = f"Objective: {objective}\n{footage}"
+    spine = _plan(vlm, prompt)
+    prompt += _plan_text(spine)
 
     script = _ask(vlm, prompt)
+    problems = _story_problems(spine, script, lines, shots)
+    if problems:
+        logger.info("story breaks its plan (%s) — asking once more", "; ".join(problems))
+        retry = _reask(vlm, f"{prompt}\n\nYour story breaks the plan:\n- " + "\n- ".join(problems)
+                       + "\nFix these and keep everything else.")
+        if retry and len(_story_problems(spine, retry, lines, shots)) < len(problems):   # only accept an improvement
+            script = retry
     items, speech_s, food_s = _build(conn, script, lines, shots, assets, fingerprint)
     if food_s and speech_s > SPEECH_PER_FOOD * food_s:
         # Food focus is the point and the LLM drifts towards talk, so give it a measured budget once.
         budget = SPEECH_PER_FOOD * food_s
         logger.info("%.0fs of speech vs %.0fs of food — asking for a food-focused cut", speech_s, food_s)
-        retry = _ask(vlm, f"{prompt}\n\nYour story has {speech_s:.0f}s of spoken lines but only {food_s:.0f}s "
-                          f"of food. Make it food-focused: the spoken lines must total at most {budget:.0f}s. "
-                          f"Keep the best lines (plan, ordering, reactions, verdict), cut the chatter, and "
-                          f"keep every food shot.")
-        items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint)
-        if speech2 / max(food2, 1) < speech_s / food_s:      # only accept an improvement
-            script, items = retry, items2
+        retry = _reask(vlm, f"{prompt}\n\nYour story has {speech_s:.0f}s of spoken lines but only {food_s:.0f}s "
+                            f"of food. Make it food-focused: the spoken lines must total at most {budget:.0f}s. "
+                            f"Keep the best lines (plan, ordering, reactions, verdict), cut the chatter, and "
+                            f"keep every food shot.")
+        if retry:
+            items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint)
+            if speech2 / max(food2, 1) < speech_s / food_s and \
+                    len(_story_problems(spine, retry, lines, shots)) <= len(_story_problems(spine, script, lines, shots)):
+                script, items = retry, items2                 # only accept an improvement that keeps the plan
 
-    board = EDL(name=name, objective=objective, style="script", items=items)
+    board = EDL(name=name, objective=objective, style="script", items=items, story=spine.model_dump())
     board.target_duration_s = round(board.duration_s, 1)  # no target: record what the story came to
     edl_mod.save(conn, board)
     return board, script.title

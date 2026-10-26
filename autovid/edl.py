@@ -49,6 +49,8 @@ class EDL(BaseModel):
     mode: str | None = None               # beat | cinematic | hybrid
     # v4 — provenance: EDL compiled from a storyboard
     storyboard_id: str | None = None
+    # script stage: the story plan (premise, hook, threads, ending) the cut was checked against
+    story: dict | None = None
 
     @property
     def duration_s(self) -> float:
