@@ -67,7 +67,9 @@ each dish), and follow a shot with the line that reacts to it when there is one.
 Story shape: open on a hook (the most striking or funniest moment, ideally the best-looking \
 dish), then brief setup (where we are, what we want), the outing and its small stakes, the \
 payoff (the food and the reactions), and a closing line that resolves the story rather than \
-repeating the intro. Keep chronological order except for the hook. No fixed length: include \
+repeating the intro. Keep chronological order except for the hook. Within one take, list that \
+take's lines and shots in the order they were captured (their @m:ss times ascending), unless it \
+is the hook. No fixed length: include \
 everything the story needs and nothing it does not (skip gibberish, filler, repeated lines, \
 waiting chatter; never pick a menu board).
 
