@@ -40,16 +40,21 @@ def run(
     recursive: bool = typer.Option(False, "--recursive/--no-recursive",
                                    help="Scan subfolders (off by default: they often hold earlier outputs)."),
     force: bool = typer.Option(False, "--force", help="Redo transcribe and analyze for every asset."),
+    catalog: bool = typer.Option(False, "--catalog", help="After analyze, also run cut and organize "
+                                 "to build the segment catalog."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default: catalog/<folder name>)."),
 ) -> None:
     """Folder → catalog → story in one go: ingest, sample, transcribe, analyze, then (with --objective)
-    story, check and render. Resumes where it left off; re-run it after adding footage."""
+    story, check and render. With --catalog, also cut and organize into the segment catalog. Resumes
+    where it left off; re-run it after adding footage."""
     import re
 
     from . import sampling
     from .analyze import analyze_asset
     from .check import check_edl
     from .decisions import DecisionClient
+    from .organize import organize_asset
+    from .refine import cut_asset
     from .render import render_edl
     from .script import write_script
     from .transcribe import load_model, transcribe_asset
@@ -94,6 +99,12 @@ def run(
     statuses = ("sampled", "analyzed", "cut", "organized") if force else ("sampled",)
     stage("analyze", [r["id"] for st in statuses for r in sampling.pending_assets(conn, st)],
           lambda aid: analyze_asset(conn, settings, aid, vlm=vlm, decisions=decisions))
+
+    if catalog:
+        stage("cut", [r["id"] for r in sampling.pending_assets(conn, "analyzed")],
+              lambda aid: cut_asset(conn, settings, aid, decisions=decisions))
+        stage("organize", [r["id"] for r in sampling.pending_assets(conn, "cut")],
+              lambda aid: organize_asset(conn, settings, aid))
 
     if not objective:
         console.print("[dim]Add --objective \"…\" to write the story, check it and render a preview.[/dim]")
@@ -389,7 +400,7 @@ def check(
     edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
-    """Lint an EDL: replayed footage, look-alike food shots, tiny clips, food share, mixed formats."""
+    """Lint an EDL: replayed footage, story order, look-alike food shots, tiny clips, food share, mixed formats."""
     from .check import check_edl
 
     settings: Settings = get_settings()

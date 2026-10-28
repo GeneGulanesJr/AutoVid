@@ -191,9 +191,10 @@ autovid run "C:\path\to\footage" --objective "a food vlog: a day at the mall, th
 
 Runs ingest → sample → transcribe → analyze, then (with `--objective`) writes the story, lints it and renders a
 preview. The catalog lives in `catalog/<folder name>` (override with `--data-dir`); re-running only does what is
-missing, so you can add footage and run it again (`--force` redoes transcribe and analyze). It first makes one real
-call to your VLM, so a bad key, base URL, model or parameter stops the run immediately with the server's own reason
-(the Settings page has the same **Test connection** button).
+missing, so you can add footage and run it again (`--force` redoes transcribe and analyze). Add `--catalog` to also
+run `cut` and `organize` after analyze, building the segment catalog (segments, clips, tags) in the same pass. It
+first makes one real call to your VLM, so a bad key, base URL, model or parameter stops the run immediately with
+the server's own reason (the Settings page has the same **Test connection** button).
 
 - `autovid check [edl]` lints an EDL: footage that plays twice, food shots that look the same, tiny clips, food
   share of the runtime, a timelapse used too much, mixed formats. Exits non-zero on a defect. `script` and `run`
