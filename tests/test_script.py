@@ -98,12 +98,15 @@ def test_whispercpp_backend_parses_json_and_warns_on_cpu_fallback(conn, tmp_path
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        if "-oj" in cmd:  # the whisper-cli call
+        if "-of" in cmd:  # the whisper-cli call (ffmpeg has no -of)
             out = cmd[cmd.index("-of") + 1]
             Path(out + ".json").write_text(json.dumps({
                 "result": {"language": "tl"},
                 "transcription": [
-                    {"offsets": {"from": 500, "to": 9500}, "text": " Tara na!"},  # end stretched over silence
+                    # word timing says the speech ends at 0.8s; the segment stretches to 9.5s
+                    {"offsets": {"from": 500, "to": 9500}, "text": " Tara na!",
+                     "tokens": [{"text": "[_BEG_]", "t_dtw": -1}, {"text": " Tara", "t_dtw": 500},
+                                {"text": " na!", "t_dtw": 800}, {"text": "[_END_]", "t_dtw": -1}]},
                     {"offsets": {"from": 3000, "to": 3500}, "text": "  "}]}), encoding="utf-8")
         return SimpleNamespace(returncode=0, stderr="")  # no "ggml_vulkan: Found" line
 
@@ -112,9 +115,11 @@ def test_whispercpp_backend_parses_json_and_warns_on_cpu_fallback(conn, tmp_path
         assert transcribe_asset(conn, s, "a_0") == 1
     assert "ran on the CPU" in caplog.text
     row = conn.execute("SELECT start_s, end_s, text, language FROM transcripts").fetchone()
-    assert tuple(row) == (0.5, 0.5 + 8 / 9 + 0.5, "Tara na!", "tl")  # end capped by speaking rate
+    assert (row["start_s"], row["text"], row["language"]) == (0.5, "Tara na!", "tl")
+    assert row["end_s"] == pytest.approx(1.2)  # first→last word + last-word tail, not the 9.5s stretch
     whisper_call = calls[1]
     assert "--vad" in whisper_call and whisper_call[whisper_call.index("-l") + 1] == "auto"
+    assert "-ojf" in whisper_call and whisper_call[whisper_call.index("-dtw") + 1] == "large-v3"
 
 
 def test_script_orders_lines_and_shots_and_merges_adjacent_speech(conn):
