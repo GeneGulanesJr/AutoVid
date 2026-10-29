@@ -11,12 +11,20 @@ and picks the lines and shots. Code then guarantees:
 - nothing repeats: no stretch of footage plays twice (speech claims its time
   first, food shots take the free part of their window), and a shot whose frame
   is near-identical to an earlier shot of the same take is dropped (analysis
-  windows of one continuous scene would otherwise yield a run of look-alikes).
+  windows of one continuous scene would otherwise yield a run of look-alikes), and
+- a timelapse asset gives at most one food shot; with ``timelapse_montage`` it
+  gives one continuous montage of up to half its own length instead (centred on
+  its best window), falling back to the plain best shot when speech leaves no room.
 
-shortcut: a food shot is a free 4 s slice of the analysis window that lists the
-dish (the VLM says which dishes a window shows, not when); shorter analysis
-windows (AUTOVID_COARSE_WINDOW_S=8) make this accurate enough.
-Upgrade: per-frame dish timing.
+Per-frame dish timing (``dish_moments``): the window analysis only lists which
+dishes an 8 s window shows, not when, so after the dish judge picks the shots,
+the 2 s grid frames of every kept food window are labelled by the VLM (one image
+per call: which dishes are visible, which ONE dish is the subject, framing
+close-up/wide), and each shot is cut around the first frame where its dish is
+the subject — falling back to a frame that merely shows the dish (close-up
+preferred) and to the plain window-centre slice when nothing matches. Cost:
+about 240 single-image VLM calls per 8 minutes of food footage (~4 per 8 s
+window — labelling stops once a frame makes the dish the subject).
 """
 from __future__ import annotations
 
@@ -43,6 +51,7 @@ PAD_BEFORE_S = 0.2       # breathing room so words aren't clipped
 PAD_AFTER_S = 0.3
 SHOT_S = 4.0             # length of a food shot
 MIN_SHOT_S = 1.5         # a free slice shorter than this is not worth a shot
+FRAME_GRID_S = 2.0       # dish_moments: label one frame per grid step inside a food window
 MAX_CANDIDATES = 30       # food windows shown to the dish judge (best-quality first)
 SPEECH_PER_FOOD = 1.5     # food focus: spoken seconds allowed per food second before one re-ask
 SAME_SCENE_BITS = 18     # frame fingerprints (64 bits) closer than this = the same look
@@ -67,7 +76,9 @@ each dish), and follow a shot with the line that reacts to it when there is one.
 Story shape: open on a hook (the most striking or funniest moment, ideally the best-looking \
 dish), then brief setup (where we are, what we want), the outing and its small stakes, the \
 payoff (the food and the reactions), and a closing line that resolves the story rather than \
-repeating the intro. Keep chronological order except for the hook. No fixed length: include \
+repeating the intro. Keep chronological order except for the hook. Within one take, list that \
+take's lines and shots in the order they were captured (their @m:ss times ascending), unless it \
+is the hook. No fixed length: include \
 everything the story needs and nothing it does not (skip gibberish, filler, repeated lines, \
 waiting chatter; never pick a menu board).
 
@@ -98,8 +109,9 @@ def _fingerprint(path: str, ts: float) -> int | None:
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            img = Image.open(frame_at(path, ts, Path(tmp) / "f.jpg", width=96)).convert("L").resize((9, 8))
-            px = list(img.getdata())
+            _, frame = frame_at(path, ts, Path(tmp) / "f.jpg", width=96)
+            img = Image.open(frame).convert("L").resize((9, 8))
+            px = img.tobytes()          # raw 8-bit grayscale pixels, row-major (getdata is deprecated)
     except Exception as e:  # noqa: BLE001 — unreadable frame: treat as "not a repeat"
         logger.debug("no fingerprint for %s@%.1f: %s", path, ts, e)
         return None
@@ -182,7 +194,7 @@ def _pick_best_shots(vlm: VLMClient, shots: dict[int, dict]) -> set[int]:
                                                   f"{s['name']} @{_fmt_clock(s['start'])}"
                                                   f"{'; TIMELAPSE' if s['timelapse'] else ''})"})
             try:
-                frame = frame_at(s["path"], (s["start"] + s["end"]) / 2, Path(tmp) / f"{s['id']}.jpg", width=512)
+                frame = frame_at(s["path"], (s["start"] + s["end"]) / 2, Path(tmp) / f"{s['id']}.jpg", width=512)[1]
                 parts.append({"type": "image_url", "image_url": {"url": data_uri(b64_jpeg(frame, max_width=512))}})
             except Exception as e:  # noqa: BLE001 — judge from the listing alone
                 logger.warning("no frame for shot S%d: %s", s["id"], e)
@@ -197,6 +209,78 @@ def _pick_best_shots(vlm: VLMClient, shots: dict[int, dict]) -> set[int]:
         mine = sorted((i for i in best if shots[i]["asset_id"] == asset_id), key=lambda i: -shots[i]["quality"])
         best -= set(mine[1:])
     return best
+
+
+_FRAME_SYSTEM = """You label one frame of a food-vlog shot. Say which dishes are visible in the \
+image, which ONE dish is the subject of the frame (the one it is mostly about: clearly visible, \
+in focus, framed — a wide table scene where every plate is equally small has no subject), and \
+the framing (close-up = the dish fills the frame, wide = the dish sits in a bigger scene). The \
+dish names an earlier pass listed for this shot are noisy: use your own words for what you see.
+
+Reply with JSON only: {"dishes": [str], "subject": str | null, "framing": "close-up" | "wide"}"""
+
+
+def _dish_moments(vlm: VLMClient, shots: dict[int, dict]) -> dict[int, float]:
+    """Per-frame dish timing: {shot id: the moment its dish is the subject}.
+
+    The window analysis only says which dishes a window shows, not when, so the 2 s grid
+    frames of each window are labelled one image per ``ask_json`` call. A shot's moment is
+    the first frame whose subject is its dish (labelling that window stops there); when no
+    frame makes it the subject, the first frame that at least shows the dish — a close-up
+    preferred — is the moment; when nothing matches, the shot id is omitted and the caller
+    keeps the window-centre slice. Frames that cannot be extracted or labelled are skipped;
+    once the VLM is unavailable, the remaining windows are not asked either.
+    """
+    if not shots:
+        return {}
+    from .ffmpeg_io.frames import frame_at
+
+    def names(dish: str, text: str) -> bool:
+        d, t = dish.strip().lower(), (text or "").strip().lower()
+        return bool(d) and bool(t) and (d in t or t in d)   # noisy names: "pancakes" in "pancakes with syrup"
+
+    moments: dict[int, float] = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for sid, s in sorted(shots.items()):
+            ws, we = s["start"], s["end"]
+            grid, i = [], 0                                  # the 2 s grid, never at the exact window edge
+            while ws + FRAME_GRID_S * i <= we:
+                t = round(min(max(ws + FRAME_GRID_S * i, ws + 0.5), we - 0.5), 3)
+                if not grid or t > grid[-1]:
+                    grid.append(t)
+                i += 1
+            dish = s["foods"][0]
+            fallback: tuple[float, bool] | None = None       # (ts, the dish fills the frame)
+            try:
+                for t in grid:
+                    try:
+                        frame = frame_at(s["path"], t, Path(tmp) / f"{sid}_{t:g}.jpg", width=512)[1]
+                        reply = vlm.ask_json(_FRAME_SYSTEM, [
+                            {"type": "text",
+                             "text": f"Frame of shot S{sid} ({s['name']} @{_fmt_clock(t)}), "
+                                     f"listed dish: {dish}."},
+                            {"type": "image_url",
+                             "image_url": {"url": data_uri(b64_jpeg(frame, max_width=512))}},
+                        ])
+                        subject = str(reply.get("subject") or "")
+                        visible = any(names(dish, str(d)) for d in reply.get("dishes") or [])
+                        close = "close" in str(reply.get("framing") or "").lower()
+                    except VLMUnavailable:
+                        raise
+                    except Exception as e:  # noqa: BLE001 — no frame or a malformed reply: not the moment
+                        logger.warning("no label for shot S%d @%.1fs: %s", sid, t, e)
+                        continue
+                    if names(dish, subject):
+                        moments[sid] = t
+                        break                                # the dish is the subject: the rest of the window cannot beat this
+                    if visible and (fallback is None or (not fallback[1] and close)):
+                        fallback = (t, close)
+            except VLMUnavailable as e:
+                logger.warning("frame labelling failed (%s) — keeping window-centre slices", e)
+                break                                        # the service is down: stop asking about the rest
+            if fallback is not None and sid not in moments:
+                moments[sid] = fallback[0]
+    return moments
 
 
 def _ask(vlm: VLMClient, footage: str) -> Script:
@@ -222,10 +306,12 @@ def _picked(script: Script, lines: dict[int, dict], shots: dict[int, dict]) -> l
     return picked
 
 
-def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]]) -> tuple[float, float] | None:
-    """The best SHOT_S-or-shorter slice of ``window`` that touches no ``blocked`` range, or None.
+def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]],
+                cap: float = SHOT_S, centre: float | None = None) -> tuple[float, float] | None:
+    """The best ``cap``-or-shorter slice of ``window`` that touches no ``blocked`` range, or None.
 
-    Best = the longest free stretch (ties: closest to the window centre), centred in that stretch.
+    Best = the longest free stretch (ties: closest to ``centre`` — the window centre, or a
+    per-frame dish moment), centred in that stretch.
     """
     ws, we = window
     free, cursor = [], ws
@@ -237,15 +323,15 @@ def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]])
         cursor = max(cursor, be)
     if cursor < we:
         free.append((cursor, we))
-    centre = (ws + we) / 2
+    c = (ws + we) / 2 if centre is None else min(max(centre, ws), we)
     # a sliver squeezed between speech clips is not a shot: the dish is already on screen while they talk
-    need = max(MIN_SHOT_S, min(SHOT_S, we - ws) / 2)
+    need = max(MIN_SHOT_S, min(cap, we - ws) / 2)
     free = [f for f in free if f[1] - f[0] >= need]
     if not free:
         return None
-    s, e = max(free, key=lambda f: (min(f[1] - f[0], SHOT_S), -abs((f[0] + f[1]) / 2 - centre)))
-    length = min(e - s, SHOT_S)
-    start = min(max(centre - length / 2, s), e - length)
+    s, e = max(free, key=lambda f: (min(f[1] - f[0], cap), -abs((f[0] + f[1]) / 2 - c)))
+    length = min(e - s, cap)
+    start = min(max(c - length / 2, s), e - length)
     return round(start, 3), round(start + length, 3)
 
 
@@ -269,9 +355,14 @@ def _cover_segment(conn: sqlite3.Connection, asset: sqlite3.Row) -> int:
 
 def _build(
     conn: sqlite3.Connection, script: Script, lines: dict[int, dict], shots: dict[int, dict],
-    assets: dict[str, sqlite3.Row], fingerprint: Fingerprint,
+    assets: dict[str, sqlite3.Row], fingerprint: Fingerprint, *, timelapse_montage: bool = False,
+    moments: dict[int, float] | None = None,
 ) -> tuple[list[EDLItem], float, float]:
-    """Turn the LLM's story into EDL items; returns (items, speech seconds, food seconds)."""
+    """Turn the LLM's story into EDL items; returns (items, speech seconds, food seconds).
+
+    ``moments``: {shot id: ts} from per-frame dish timing — a shot with a moment is placed
+    centred on it instead of on its window centre (same free/replay/look-alike guards).
+    """
     picked = _picked(script, lines, shots)
     if not picked:
         raise AutoVidError("the model picked no usable lines")
@@ -316,7 +407,9 @@ def _build(
 
     def place(shot: dict) -> tuple[float, float] | None:
         """Fit ``shot`` (reserving its range) unless it overlaps used footage or repeats a kept look."""
-        span = _free_slice((shot["start"], shot["end"]), blocked.get(shot["asset_id"], []))
+        span = _free_slice((shot["start"], shot["end"]), blocked.get(shot["asset_id"], []),
+                           cap=shot.get("cap", SHOT_S),
+                           centre=None if moments is None else moments.get(shot["id"]))
         if span is None:
             return None
         fp = fingerprint(shot["path"], (span[0] + span[1]) / 2)
@@ -328,18 +421,49 @@ def _build(
         blocked.setdefault(shot["asset_id"], []).append(span)
         return span
 
+    # Timelapse option: one continuous montage of up to half the asset, centred on the asset's
+    # best food window, instead of the single best shot. Placed before the plain shots so it
+    # claims its span first; if speech leaves less than half the span free (or the asset is too
+    # short for a real montage), the plain best shot below plays instead.
+    montages: list[dict] = []
+    if timelapse_montage:
+        best_tl: dict[str, dict] = {}
+        for shot in shots.values():
+            if shot["timelapse"]:
+                shot["skip"] = False                       # rebuilds must not inherit an earlier verdict
+                if shot["asset_id"] not in best_tl or shot["quality"] > best_tl[shot["asset_id"]]["quality"]:
+                    best_tl[shot["asset_id"]] = shot
+        for asset_id, b in best_tl.items():
+            dur = float(assets[asset_id]["duration_s"] or 0.0)
+            centre = (b["start"] + b["end"]) / 2
+            length = min(dur / 2, 2 * min(centre, dur - centre))
+            if length < SHOT_S:
+                continue
+            montage = {**b, "start": max(0.0, centre - length / 2), "end": min(dur, centre + length / 2),
+                       "cap": length}
+            if (span := place(montage)) is not None:
+                b["skip"] = True                           # the montage replaces the single best shot
+                montages.append({"key": (b["name"], b["start"]), "shot": montage, "span": span})
+
     kept: list[dict] = []
     for s in slots:
         if s["kind"] == "line":
             kept.append(s)
-        elif (span := place(s["shot"])) is not None:
+        elif not s["shot"].get("skip") and (span := place(s["shot"])) is not None:
             s["span"] = span
             kept.append(s)
     slots = kept
+    for m in montages:                                     # capture order, like the shots added below
+        at = max((i + 1 for i, s in enumerate(slots) if s["key"] <= m["key"]),
+                 default=min(1, len(slots)))
+        slots.insert(at, {"label": slots[at - 1]["label"] if at else "Food", "kind": "shot",
+                          "key": m["key"], "shot": m["shot"], "span": m["span"]})
 
     # 3. Every food moment the story skipped is added where it falls in capture order (best frames
     #    first, so a static scene keeps its best shot and the rest drop out as look-alikes).
     for shot in sorted(shots.values(), key=lambda x: -x["quality"]):
+        if shot.get("skip"):
+            continue
         if any(s["kind"] == "shot" and s["shot"] is shot for s in slots):
             continue
         if (span := place(shot)) is None:
@@ -365,20 +489,32 @@ def _build(
 
 def write_script(
     conn: sqlite3.Connection, vlm: VLMClient, *, objective: str, name: str = "script-cut",
-    fingerprint: Fingerprint = _fingerprint,
+    fingerprint: Fingerprint = _fingerprint, timelapse_montage: bool = False,
+    dish_moments: bool = False,
 ) -> tuple[EDL, str]:
-    """Ask the LLM for the story, turn it into an EDL; returns (EDL, title)."""
+    """Ask the LLM for the story, turn it into an EDL; returns (EDL, title).
+
+    ``timelapse_montage``: a timelapse asset contributes one continuous span of up to half its
+    own length (centred on its best food window) instead of the single best shot.
+
+    ``dish_moments``: after the judge's picks, label the 2 s grid frames of every kept food
+    window with the VLM (about 240 single-image calls per 8 minutes of food footage) and cut
+    each shot around the frame where its dish is the subject; shots with no matching frame
+    keep the window-centre slice. Off by default.
+    """
     footage, lines, shots = _source_prompt(conn)
     if not lines:
         raise AutoVidError("no transcripts in the catalog — run `transcribe` first")
     best = _pick_best_shots(vlm, shots)
     if best != set(shots):
         footage, lines, shots = _source_prompt(conn, keep=best)
+    moments = _dish_moments(vlm, shots) if dish_moments and shots else {}
     assets = {a["id"]: a for a in conn.execute("SELECT id, original_name, duration_s FROM assets")}
     prompt = f"Objective: {objective}\n{footage}"
 
     script = _ask(vlm, prompt)
-    items, speech_s, food_s = _build(conn, script, lines, shots, assets, fingerprint)
+    items, speech_s, food_s = _build(conn, script, lines, shots, assets, fingerprint,
+                                     timelapse_montage=timelapse_montage, moments=moments)
     if food_s and speech_s > SPEECH_PER_FOOD * food_s:
         # Food focus is the point and the LLM drifts towards talk, so give it a measured budget once.
         budget = SPEECH_PER_FOOD * food_s
@@ -387,7 +523,8 @@ def write_script(
                           f"of food. Make it food-focused: the spoken lines must total at most {budget:.0f}s. "
                           f"Keep the best lines (plan, ordering, reactions, verdict), cut the chatter, and "
                           f"keep every food shot.")
-        items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint)
+        items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint,
+                                        timelapse_montage=timelapse_montage, moments=moments)
         if speech2 / max(food2, 1) < speech_s / food_s:      # only accept an improvement
             script, items = retry, items2
 

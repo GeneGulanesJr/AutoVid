@@ -7,8 +7,12 @@ from autovid import db
 from autovid.kinds import classify
 
 
-def _asset(conn, n, *, at, dur, fps=23.98, size=(3840, 2880), audio=1):
+def _asset(conn, n, *, at, dur, fps=23.98, size=(3840, 2880), audio=1, streams=None, format_tags=None):
     tags = {"format": {"tags": {"creation_time": f"2026-10-06T{at}.000000Z"}}}
+    if format_tags:
+        tags["format"]["tags"].update(format_tags)
+    if streams is not None:
+        tags["streams"] = [{"tags": s} for s in streams]
     conn.execute(
         "INSERT INTO assets (id, sha256, path, original_path, original_name, duration_s, fps, width, height,"
         " has_audio, ffprobe_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -38,3 +42,35 @@ def test_extreme_gap_alone_marks_a_timelapse_and_missing_metadata_is_harmless(tm
               " VALUES ('x', 'sx', 'p', 'p', 'x.mp4', 10, 'not json')")
     kinds = classify(c)
     assert "timelapse" in kinds["a0"] and kinds["x"] <= {"no_audio", "other_camera"}
+
+
+def test_container_timelapse_flag_is_read_from_format_and_stream_tags(tmp_path):
+    c = db.connect(tmp_path / "k.db")
+    _asset(c, 0, at="01:00:00", dur=30,
+           format_tags={"com.apple.quicktime.settings.timelapse": "true"})     # tag KEY names it
+    _asset(c, 1, at="01:01:00", dur=30,
+           streams=[{"creation_time": "2026-10-06T01:00:30Z"},
+                    {"Apple": "TimeLapse video of the table"}])                # stream tag VALUE names it
+    _asset(c, 2, at="01:02:00", dur=30)                            # a plain 1-minute gap: no signal
+    kinds = classify(c)
+    assert "timelapse" in kinds["a0"] and "timelapse" in kinds["a1"]
+    assert kinds["a2"] == set()
+
+
+def test_last_clip_counts_when_it_dwarfs_the_sessions_other_clips(tmp_path):
+    c = db.connect(tmp_path / "k.db")
+    _asset(c, 0, at="01:00:00", dur=60)
+    _asset(c, 1, at="01:02:00", dur=60)
+    _asset(c, 2, at="01:04:00", dur=1500)                          # the last clip: 25x the 60 s median
+    kinds = classify(c)
+    assert kinds["a2"] == {"timelapse"}                            # no next clip, so no gap to measure
+    assert kinds["a0"] == set() and kinds["a1"] == set()
+
+
+def test_last_clip_of_ordinary_length_is_not_a_timelapse(tmp_path):
+    c = db.connect(tmp_path / "k.db")
+    _asset(c, 0, at="01:00:00", dur=60)
+    _asset(c, 1, at="01:02:00", dur=60)
+    _asset(c, 2, at="01:04:00", dur=300)                           # 5x the others: a long pause, not one
+    kinds = classify(c)
+    assert kinds["a2"] == set()

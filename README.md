@@ -173,9 +173,17 @@ mocked model calls — no network, no API key needed).
 `autovid transcribe --all` fills the `transcripts` table; `autovid script "<objective>" --duration 60`
 then has the LLM pick the spoken lines that tell the story (speech-only EDL, render as usual).
 
+**One-command GPU setup:** `autovid setup-whisper` downloads the whisper.cpp Vulkan build, the
+`ggml-large-v3.bin` model and the silero VAD model into `~/.whisper-vulkan` (override with
+`AUTOVID_WHISPERCPP_DIR`), checks them against the sha256 hashes and sizes pinned in
+`autovid/whisper_setup.py`, and runs a one-second self-test that fails loudly if whisper.cpp
+silently falls back to the CPU (update your GPU driver, then re-run). Re-runs only download
+or extract what is missing or changed.
+
 Backends (`AUTOVID_WHISPER_BACKEND`, default `auto`):
 
-- **whispercpp** (AMD/Intel/NVIDIA GPU via Vulkan). Put a Windows Vulkan build of whisper.cpp at
+- **whispercpp** (AMD/Intel/NVIDIA GPU via Vulkan). Manual fallback for the command above: put a
+  Windows Vulkan build of whisper.cpp at
   `~/.whisper-vulkan/bin/whisper-cli.exe` (e.g. `whisper-*-windows-vulkan-x64.zip` from
   lemonade-sdk/whisper.cpp-rocm releases), plus `models/ggml-large-v3.bin`
   (huggingface.co/ggerganov/whisper.cpp) and `models/ggml-silero-v5.1.2.bin`
@@ -191,9 +199,10 @@ autovid run "C:\path\to\footage" --objective "a food vlog: a day at the mall, th
 
 Runs ingest → sample → transcribe → analyze, then (with `--objective`) writes the story, lints it and renders a
 preview. The catalog lives in `catalog/<folder name>` (override with `--data-dir`); re-running only does what is
-missing, so you can add footage and run it again (`--force` redoes transcribe and analyze). It first makes one real
-call to your VLM, so a bad key, base URL, model or parameter stops the run immediately with the server's own reason
-(the Settings page has the same **Test connection** button).
+missing, so you can add footage and run it again (`--force` redoes transcribe and analyze). Add `--catalog` to also
+run `cut` and `organize` after analyze, building the segment catalog (segments, clips, tags) in the same pass. It
+first makes one real call to your VLM, so a bad key, base URL, model or parameter stops the run immediately with
+the server's own reason (the Settings page has the same **Test connection** button).
 
 - `autovid check [edl]` lints an EDL: footage that plays twice, food shots that look the same, tiny clips, food
   share of the runtime, a timelapse used too much, mixed formats. Exits non-zero on a defect. `script` and `run`

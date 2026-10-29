@@ -40,16 +40,21 @@ def run(
     recursive: bool = typer.Option(False, "--recursive/--no-recursive",
                                    help="Scan subfolders (off by default: they often hold earlier outputs)."),
     force: bool = typer.Option(False, "--force", help="Redo transcribe and analyze for every asset."),
+    catalog: bool = typer.Option(False, "--catalog", help="After analyze, also run cut and organize "
+                                 "to build the segment catalog."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default: catalog/<folder name>)."),
 ) -> None:
     """Folder → catalog → story in one go: ingest, sample, transcribe, analyze, then (with --objective)
-    story, check and render. Resumes where it left off; re-run it after adding footage."""
+    story, check and render. With --catalog, also cut and organize into the segment catalog. Resumes
+    where it left off; re-run it after adding footage."""
     import re
 
     from . import sampling
     from .analyze import analyze_asset
     from .check import check_edl
     from .decisions import DecisionClient
+    from .organize import organize_asset
+    from .refine import cut_asset
     from .render import render_edl
     from .script import write_script
     from .transcribe import load_model, transcribe_asset
@@ -95,11 +100,19 @@ def run(
     stage("analyze", [r["id"] for st in statuses for r in sampling.pending_assets(conn, st)],
           lambda aid: analyze_asset(conn, settings, aid, vlm=vlm, decisions=decisions))
 
+    if catalog:
+        stage("cut", [r["id"] for r in sampling.pending_assets(conn, "analyzed")],
+              lambda aid: cut_asset(conn, settings, aid, decisions=decisions))
+        stage("organize", [r["id"] for r in sampling.pending_assets(conn, "cut")],
+              lambda aid: organize_asset(conn, settings, aid))
+
     if not objective:
         console.print("[dim]Add --objective \"…\" to write the story, check it and render a preview.[/dim]")
         return
     try:
-        board, title = write_script(conn, vlm, objective=objective, name=name)
+        board, title = write_script(conn, vlm, objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]story: {e}[/red]")
         raise typer.Exit(1)
@@ -389,7 +402,7 @@ def check(
     edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
-    """Lint an EDL: replayed footage, look-alike food shots, tiny clips, food share, mixed formats."""
+    """Lint an EDL: replayed footage, story order, look-alike food shots, tiny clips, food share, mixed formats."""
     from .check import check_edl
 
     settings: Settings = get_settings()
@@ -436,6 +449,27 @@ def transcribe(
         console.print(f"[green]{aid}[/green] ({i}/{len(targets)}): {n} utterances")
 
 
+@app.command("setup-whisper")
+def setup_whisper_cmd(
+    model: str | None = typer.Option(None, help="ggml model to install (default: AUTOVID_WHISPER_MODEL)."),
+) -> None:
+    """Download + verify the whisper.cpp Vulkan build, the model and the VAD model, then self-test.
+
+    Installs into whispercpp_dir (~/.whisper-vulkan by default). Binary and model hashes are
+    pinned in autovid/whisper_setup.py; the self-test fails loudly when the GPU is not used.
+    """
+    from .errors import AutoVidError
+    from .whisper_setup import setup_whisper
+
+    settings: Settings = get_settings()
+    try:
+        summary = setup_whisper(settings, model=model)
+    except AutoVidError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{summary}[/green]")
+
+
 @app.command()
 def script(
     objective: str = typer.Argument(..., help="What the vlog is about, e.g. 'mall day + pancake breakfast'."),
@@ -451,7 +485,9 @@ def script(
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
     try:
-        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name)
+        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)

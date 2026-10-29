@@ -56,6 +56,11 @@ SETTING_GROUPS: list[dict] = [
             {"key": "AUTOVID_GRID_INTERVAL_S", "label": "Grid interval (s)", "secret": False},
             {"key": "AUTOVID_HIGHLIGHT_THRESHOLD", "label": "Highlight threshold", "secret": False,
              "help": "Windows below this VLM score never become clips (0–1)."},
+            {"key": "AUTOVID_TIMELAPSE_MONTAGE", "label": "Timelapse montage", "secret": False,
+             "help": "true = a timelapse contributes a continuous half-length montage instead of one best shot."},
+            {"key": "AUTOVID_DISH_MOMENTS", "label": "Dish moments", "secret": False,
+             "help": "true = centre each food shot on a frame where its dish is the subject "
+                     "(extra VLM calls: ~240 per 8 min of food footage)."},
         ],
     },
 ]

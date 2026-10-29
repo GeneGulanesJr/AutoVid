@@ -66,6 +66,23 @@ def _window(conn, asset, start, end, desc, foods, score=0.5):
          json.dumps({"description": desc, "foods": foods, "highlight_score": score, "uncertainty": 0.0}))).lastrowid
 
 
+def _patch_frame_at(monkeypatch, tmp_path):
+    """Frame extraction yields one real JPEG, so dish-moment labelling has pixels to look at."""
+    import shutil
+
+    from PIL import Image
+
+    import autovid.ffmpeg_io.frames as frames_mod
+    src = tmp_path / "frame.jpg"
+    Image.new("RGB", (64, 48), (180, 120, 60)).save(src)
+
+    def fake_frame_at(source, ts, out_path, *, width=None):
+        shutil.copyfile(src, out_path)
+        return ts, out_path
+
+    monkeypatch.setattr(frames_mod, "frame_at", fake_frame_at)
+
+
 def test_transcribe_stores_confident_speech_only(conn):
     model = FakeWhisper([
         _seg(0, 2, "  Good morning, ma'am. "),
@@ -98,12 +115,15 @@ def test_whispercpp_backend_parses_json_and_warns_on_cpu_fallback(conn, tmp_path
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        if "-oj" in cmd:  # the whisper-cli call
+        if "-of" in cmd:  # the whisper-cli call (ffmpeg has no -of)
             out = cmd[cmd.index("-of") + 1]
             Path(out + ".json").write_text(json.dumps({
                 "result": {"language": "tl"},
                 "transcription": [
-                    {"offsets": {"from": 500, "to": 9500}, "text": " Tara na!"},  # end stretched over silence
+                    # word timing says the speech ends at 0.8s; the segment stretches to 9.5s
+                    {"offsets": {"from": 500, "to": 9500}, "text": " Tara na!",
+                     "tokens": [{"text": "[_BEG_]", "t_dtw": -1}, {"text": " Tara", "t_dtw": 500},
+                                {"text": " na!", "t_dtw": 800}, {"text": "[_END_]", "t_dtw": -1}]},
                     {"offsets": {"from": 3000, "to": 3500}, "text": "  "}]}), encoding="utf-8")
         return SimpleNamespace(returncode=0, stderr="")  # no "ggml_vulkan: Found" line
 
@@ -112,9 +132,11 @@ def test_whispercpp_backend_parses_json_and_warns_on_cpu_fallback(conn, tmp_path
         assert transcribe_asset(conn, s, "a_0") == 1
     assert "ran on the CPU" in caplog.text
     row = conn.execute("SELECT start_s, end_s, text, language FROM transcripts").fetchone()
-    assert tuple(row) == (0.5, 0.5 + 8 / 9 + 0.5, "Tara na!", "tl")  # end capped by speaking rate
+    assert (row["start_s"], row["text"], row["language"]) == (0.5, "Tara na!", "tl")
+    assert row["end_s"] == pytest.approx(1.2)  # first→last word + last-word tail, not the 9.5s stretch
     whisper_call = calls[1]
     assert "--vad" in whisper_call and whisper_call[whisper_call.index("-l") + 1] == "auto"
+    assert "-ojf" in whisper_call and whisper_call[whisper_call.index("-dtw") + 1] == "large-v3"
 
 
 def test_script_orders_lines_and_shots_and_merges_adjacent_speech(conn):
@@ -303,6 +325,73 @@ def test_failed_dish_judge_falls_back_to_every_food_shot(conn):
     assert sum("[food]" in i.note for i in board.items) == 2
 
 
+def test_dish_moments_cut_the_food_shot_around_the_subject_frame(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    wide = {"dishes": ["pancakes"], "subject": None, "framing": "wide"}
+    subject = {"dishes": ["pancakes"], "subject": "pancakes", "framing": "close-up"}
+    # the 2 s grid of the 12 s window: 10.5, 12, 14, ... — the dish is the subject 4 s in, at 14
+    llm = FakeLLM(wide, wide, subject,
+                  {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (12.0, 16.0)   # centred on the subject frame
+    assert len(llm.prompts) == 4      # 3 frame labels (short-circuited) + the story; no judge for one shot
+    label = llm.prompts[0]
+    assert isinstance(label, list) and sum(p.get("type") == "image_url" for p in label) == 1
+
+
+def test_failed_frame_labelling_keeps_the_window_centre_slice(conn, monkeypatch, tmp_path):
+    from autovid.vlm import VLMUnavailable
+
+    _patch_frame_at(monkeypatch, tmp_path)
+
+    class Flaky(FakeLLM):
+        def ask_json(self, system, user):
+            if "label one frame" in system:      # the frame labeller, not the story's {"label": str} spec
+                raise VLMUnavailable("down")
+            return super().ask_json(system, user)
+
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    llm = Flaky({"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (14.0, 18.0)   # the old window-centre slice
+    assert len(llm.prompts) == 1      # labelling stopped at the first failure; only the story was asked
+
+
+def test_frames_that_never_show_the_dish_keep_the_window_centre_slice(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    other = {"dishes": ["the table", "drinks"], "subject": None, "framing": "wide"}
+    llm = FakeLLM(*([other] * 7 + [   # every grid frame of the 12 s window: 10.5 … 21.5
+        {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]}]))
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (14.0, 18.0)
+    assert len(llm.prompts) == 8      # all 7 frames labelled (no short-circuit) + the story
+
+
+def test_dish_moments_fall_back_to_a_visible_frame_preferring_the_close_up(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 18.0, "a plate of pancakes", ["pancakes"])
+    wide = {"dishes": ["pancakes"], "subject": None, "framing": "wide"}
+    close = {"dishes": ["pancakes"], "subject": None, "framing": "close-up"}
+    gone = {"dishes": ["somebody's back"], "subject": None, "framing": "wide"}
+    # frames 10.5 (visible, wide), 12 (visible, close-up — the better fallback), 14 (visible but
+    # wide: does not beat the close-up), 16 and 17.5 (dish gone); no frame makes it the subject
+    llm = FakeLLM(wide, close, wide, gone, gone,
+                  {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (10.0, 14.0)   # centred on the 12 s close-up
+    assert len(llm.prompts) == 6
+
+
 def test_food_shot_is_dropped_when_only_a_sliver_of_its_window_is_free(conn):
     a = _line(conn, "a_0", 0.0, 3.8, "Pancake dool")        # speech takes 0-4.1 and 6.0-8.0 of the 8s window
     b = _line(conn, "a_0", 5.9, 7.9, "Spicy chicken")
@@ -328,3 +417,50 @@ def test_a_timelapse_contributes_at_most_its_best_shot_and_is_labelled_for_the_j
     assert any("TIMELAPSE" in p.get("text", "") for p in llm.prompts[0])        # the judge was told
     food = [i for i in board.items if "[food]" in i.note]
     assert sorted(i.note.split("[food] ")[1] for i in food) == ["noodles", "pancakes"]
+
+
+def test_timelapse_montage_option_takes_half_the_clip_as_one_continuous_span(conn, monkeypatch):
+    import autovid.script as script_mod
+
+    monkeypatch.setattr(script_mod, "classify", lambda c: {"a_0": set(), "a_1": {"timelapse"}})
+    conn.execute("UPDATE assets SET duration_s = 78 WHERE id = 'a_1'")
+    plain = _window(conn, "a_0", 5.0, 13.0, "close-up pancakes", ["pancakes"])
+    t1 = _window(conn, "a_1", 0.0, 8.0, "table", ["fried rice"], score=0.4)
+    t2 = _window(conn, "a_1", 35.0, 43.0, "table", ["noodles"], score=0.9)   # the best, centre at 39 s
+    t3 = _window(conn, "a_1", 60.0, 68.0, "table", ["fish"], score=0.5)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    judge = {"dishes": [{"dish": d, "best": i} for d, i in
+                        (("pancakes", plain), ("rice", t1), ("noodles", t2), ("fish", t3))]}
+    llm = FakeLLM(judge, {"title": "t", "beats": [{"label": "b", "order": [f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", timelapse_montage=True)
+    food = [i for i in board.items if "[food]" in i.note]
+    # one continuous 39 s span (= half of 78 s, centred on the best window's centre) replaces
+    # the single best shot; the other timelapse windows stay out
+    assert [(i.asset_id, round(i.source_start, 1), round(i.source_end, 1)) for i in food] == [
+        ("a_0", 7.0, 11.0), ("a_1", 19.5, 58.5)]
+    assert [i.asset_id for i in board.items] == ["a_0", "a_0", "a_1"]
+
+
+def test_timelapse_montage_falls_back_to_the_best_shot_when_speech_blocks_the_span(conn, monkeypatch):
+    import autovid.script as script_mod
+
+    monkeypatch.setattr(script_mod, "classify", lambda c: {"a_0": set(), "a_1": {"timelapse"}})
+    conn.execute("UPDATE assets SET duration_s = 78 WHERE id = 'a_1'")
+    t1 = _window(conn, "a_1", 0.0, 8.0, "table", ["fried rice"], score=0.4)
+    t2 = _window(conn, "a_1", 35.0, 43.0, "table", ["noodles"], score=0.9)   # the timelapse's best
+    talk = _line(conn, "a_1", 20.0, 40.0, "Ang haba ng pila")                # blocks most of the 19.5-58.5 s span
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    judge = {"dishes": [{"dish": "rice", "best": t1}, {"dish": "noodles", "best": t2}]}
+    reply = {"title": "t", "beats": [{"label": "b", "order": [f"L{a}", f"L{talk}"]}]}
+    llm = FakeLLM(judge, reply, reply)      # speech-heavy: the food-focus re-ask gets the same story
+    board, _ = write_script(conn, llm, objective="o", timelapse_montage=True)
+    food = [i for i in board.items if "[food]" in i.note]
+    # 18.2 s free < half the span → no montage; the plain best shot takes the free 40.3-43 s instead
+    assert [(i.asset_id, round(i.source_start, 1), round(i.source_end, 1)) for i in food] == [
+        ("a_1", 40.3, 43.0)]
+
+
+def test_timelapse_montage_setting_defaults_off_and_reads_the_env(monkeypatch):
+    assert Settings().timelapse_montage is False
+    monkeypatch.setenv("AUTOVID_TIMELAPSE_MONTAGE", "true")
+    assert Settings().timelapse_montage is True
