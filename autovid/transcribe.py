@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import statistics
 import subprocess
 import tempfile
 from pathlib import Path
@@ -63,7 +64,47 @@ def _run_faster_whisper(model, source: Path) -> tuple[list[Utterance], str]:
         info.language
 
 
-def _run_whispercpp(settings: Settings, source: Path) -> tuple[list[Utterance], str]:
+_LAST_WORD_TAIL_S = 0.4  # last word's own duration when there are too few words to estimate it
+_MIN_UTTERANCE_S = 0.2  # never let an utterance end at/before its start
+
+
+def _is_special_token(text: str) -> bool:
+    """[_BEG_], [_TT_4200_], <|1.00|>, … special tokens carry no word timing."""
+    return len(text) >= 2 and ((text[0] == "[" and text[-1] == "]")
+                               or (text[0] == "<" and text[-1] == ">"))
+
+
+def _utterances_from_json(data: dict) -> tuple[list[Utterance], str | None]:
+    """whisper.cpp JSON → utterances. With word timestamps (-dtw, ``t_dtw`` on tokens) each
+    utterance is trimmed to its first→last word; without them, segment offsets are used as-is.
+    VAD-stretched segment ends (whisper.cpp spreads the end over trailing silence) get cut off."""
+    rows: list[Utterance] = []
+    for seg in data["transcription"]:
+        text = seg["text"].strip()
+        if not text:
+            continue
+        offsets = seg["offsets"]
+        word_ms = [tok["t_dtw"] for tok in seg.get("tokens", [])
+                   if not _is_special_token(tok.get("text", ""))
+                   and isinstance(tok.get("t_dtw"), (int, float)) and tok["t_dtw"] >= 0]
+        if not word_ms:  # no usable word timing (plain -oj, or model without DTW heads)
+            rows.append((offsets["from"] / 1000, offsets["to"] / 1000, text))
+            continue
+        start = word_ms[0] / 1000
+        # The last word still takes time to say: estimate its duration as the median gap
+        # between consecutive word timestamps (needs ≥3 words), else a fixed short tail.
+        if len(word_ms) >= 3:
+            gaps = [b - a for a, b in zip(word_ms, word_ms[1:])]
+            tail_s = statistics.median(gaps) / 1000
+        else:
+            tail_s = _LAST_WORD_TAIL_S
+        end = min(word_ms[-1] / 1000 + tail_s, offsets["to"] / 1000)
+        end = max(end, start + _MIN_UTTERANCE_S)
+        rows.append((start, end, text))
+    return rows, data.get("result", {}).get("language")
+
+
+def _run_whispercpp(settings: Settings, source: Path) -> tuple[list[Utterance], str | None]:
     root = settings.whispercpp_dir
     model = root / "models" / f"ggml-{settings.whisper_model}.bin"
     vad = root / "models" / "ggml-silero-v5.1.2.bin"
@@ -77,26 +118,29 @@ def _run_whispercpp(settings: Settings, source: Path) -> tuple[list[Utterance], 
         # -mc 0 = no cross-segment context (same reason as condition_on_previous_text=False).
         # -vsd/-vmsd/-ml/-sow keep segments sentence-sized: the default VAD merges speech across
         # pauses into 10 s+ spans, which would make the script's cuts land on dead air.
-        proc = subprocess.run(
-            [str(_cli(settings)), "-m", str(model), "-f", str(wav), "-l", "auto", "-mc", "0",
-             "--vad", "-vm", str(vad), "-vsd", "300", "-vmsd", "6", "-ml", "70", "-sow",
-             "-oj", "-of", str(out)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
-        if proc.returncode != 0:
-            raise AutoVidError(f"whisper-cli failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}")
+        # Word timestamps (-dtw alignment heads for the model) then trim each segment to its
+        # actual speech, since the segment end itself stretches over trailing silence.
+        base = [str(_cli(settings)), "-m", str(model), "-f", str(wav), "-l", "auto", "-mc", "0",
+                "--vad", "-vm", str(vad), "-vsd", "300", "-vmsd", "6", "-ml", "70", "-sow",
+                "-of", str(out)]
+        flag_sets = (["-ojf", "-dtw", settings.whisper_model],  # full JSON + word timestamps
+                     ["-ojf"],  # no DTW alignment heads for this model: segments only
+                     ["-oj"])   # plain JSON
+        for i, extra in enumerate(flag_sets):
+            proc = subprocess.run(base + extra, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=3600)
+            if proc.returncode == 0:
+                break
+            if i + 1 < len(flag_sets):
+                logger.warning("whisper-cli %s failed (rc=%s); retrying with %s",
+                               " ".join(extra), proc.returncode, " ".join(flag_sets[i + 1]))
+            else:
+                raise AutoVidError(
+                    f"whisper-cli failed (rc={proc.returncode}): {proc.stderr.strip()[-400:]}")
         if "ggml_vulkan: Found" not in proc.stderr:  # seen in the wild: "GPU acceleration on" but CPU
             logger.warning("whisper.cpp did not report a Vulkan device — this ran on the CPU")
         data = json.loads(out.with_suffix(".json").read_text(encoding="utf-8"))
-    rows = []
-    for t in data["transcription"]:
-        text = t["text"].strip()
-        if not text:
-            continue
-        start, end = t["offsets"]["from"] / 1000, t["offsets"]["to"] / 1000
-        # shortcut: whisper.cpp stretches a segment's end over trailing silence; cap it by a slow
-        # speaking rate (9 chars/s). Upgrade: word-level timestamps (needs -dtw alignment heads).
-        rows.append((start, min(end, start + len(text) / 9 + 0.5), text))
-    return rows, data.get("result", {}).get("language")
+    return _utterances_from_json(data)
 
 
 def transcribe_asset(conn: sqlite3.Connection, settings: Settings, asset_id: str, *, model=None) -> int:

@@ -623,7 +623,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s = current_settings()
         c = conn()
         try:
-            board, title = write_script(c, VLMClient(s), objective=params.objective, name=params.name)
+            board, title = write_script(c, VLMClient(s), objective=params.objective, name=params.name,
+                                        timelapse_montage=s.timelapse_montage, dish_moments=s.dish_moments)
         except (AutoVidError, ValueError) as e:
             raise HTTPException(409, str(e)) from e
         out = {"edl_id": board.id, "title": title, "items": len(board.items), "duration_s": board.duration_s,

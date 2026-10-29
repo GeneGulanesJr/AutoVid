@@ -8,6 +8,8 @@ from typer.testing import CliRunner
 
 import autovid.analyze as analyze_mod
 import autovid.cli as cli
+import autovid.organize as organize_mod
+import autovid.refine as refine_mod
 import autovid.sampling as sampling
 import autovid.transcribe as transcribe
 from autovid import db
@@ -28,7 +30,8 @@ def env(tmp_path, monkeypatch):
         conn.execute("INSERT INTO assets (id, sha256, path, original_path, original_name, duration_s, has_audio,"
                      " status) VALUES (?,?,?,?,?,5,?, 'ingested')", (f"a{n}", f"s{n}", "p", "p", f"c{n}.mp4", audio))
     conn.commit()
-    calls: dict[str, list[str]] = {"sample": [], "transcribe": [], "analyze": [], "ping": []}
+    calls: dict[str, list[str]] = {"sample": [], "transcribe": [], "analyze": [], "ping": [],
+                                   "cut": [], "organize": []}
 
     def set_status(aid, status):
         conn.execute("UPDATE assets SET status = ? WHERE id = ?", (status, aid))
@@ -47,6 +50,17 @@ def env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transcribe, "transcribe_asset", fake_transcribe)
     monkeypatch.setattr(analyze_mod, "analyze_asset", lambda c, s, aid, **k: (calls["analyze"].append(aid), set_status(aid, "analyzed")))
+
+    def fake_cut(c, s, aid, *, decisions=None):
+        calls["cut"].append(aid)
+        set_status(aid, "cut")
+
+    def fake_organize(c, s, aid):
+        calls["organize"].append(aid)
+        set_status(aid, "organized")
+
+    monkeypatch.setattr(refine_mod, "cut_asset", fake_cut)
+    monkeypatch.setattr(organize_mod, "organize_asset", fake_organize)
     monkeypatch.setattr(VLMClient, "ping", lambda self: calls["ping"].append("ping"))
     yield folder, cat, calls
     get_settings.cache_clear()
@@ -67,6 +81,27 @@ def test_run_does_every_stage_once_and_a_second_run_resumes_with_nothing_to_do(e
 
     CliRunner().invoke(cli.app, ["run", str(folder), "--data-dir", str(cat), "--force"])
     assert calls["transcribe"] == ["a0"] and calls["analyze"] == ["a0", "a1"]       # --force redoes both
+
+
+def test_run_catalog_also_cuts_and_organizes_then_resumes_with_nothing_to_do(env):
+    folder, cat, calls = env
+    result = CliRunner().invoke(cli.app, ["run", str(folder), "--data-dir", str(cat), "--catalog"])
+    assert result.exit_code == 0, result.output
+    assert calls["cut"] == ["a0", "a1"] and calls["organize"] == ["a0", "a1"]       # whole catalog, in order
+    assert "cut: 2 asset(s)" in result.output and "organize: 2 asset(s)" in result.output
+    assert "Add --objective" in result.output                                       # --catalog runs regardless of --objective
+
+    for k in ("cut", "organize"):
+        calls[k].clear()
+    second = CliRunner().invoke(cli.app, ["run", str(folder), "--data-dir", str(cat), "--catalog"])
+    assert second.exit_code == 0 and not (calls["cut"] or calls["organize"])        # resumed: already organized
+
+
+def test_run_without_catalog_never_cuts_or_organizes(env):
+    folder, cat, calls = env
+    result = CliRunner().invoke(cli.app, ["run", str(folder), "--data-dir", str(cat)])
+    assert result.exit_code == 0, result.output
+    assert not (calls["cut"] or calls["organize"])
 
 
 def test_run_stops_before_any_slow_stage_when_the_vlm_check_fails(env, monkeypatch):

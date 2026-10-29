@@ -40,16 +40,21 @@ def run(
     recursive: bool = typer.Option(False, "--recursive/--no-recursive",
                                    help="Scan subfolders (off by default: they often hold earlier outputs)."),
     force: bool = typer.Option(False, "--force", help="Redo transcribe and analyze for every asset."),
+    catalog: bool = typer.Option(False, "--catalog", help="After analyze, also run cut and organize "
+                                 "to build the segment catalog."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default: catalog/<folder name>)."),
 ) -> None:
     """Folder → catalog → story in one go: ingest, sample, transcribe, analyze, then (with --objective)
-    story, check and render. Resumes where it left off; re-run it after adding footage."""
+    story, check and render. With --catalog, also cut and organize into the segment catalog. Resumes
+    where it left off; re-run it after adding footage."""
     import re
 
     from . import sampling
     from .analyze import analyze_asset
     from .check import check_edl
     from .decisions import DecisionClient
+    from .organize import organize_asset
+    from .refine import cut_asset
     from .render import render_edl
     from .script import write_script
     from .transcribe import load_model, transcribe_asset
@@ -95,11 +100,19 @@ def run(
     stage("analyze", [r["id"] for st in statuses for r in sampling.pending_assets(conn, st)],
           lambda aid: analyze_asset(conn, settings, aid, vlm=vlm, decisions=decisions))
 
+    if catalog:
+        stage("cut", [r["id"] for r in sampling.pending_assets(conn, "analyzed")],
+              lambda aid: cut_asset(conn, settings, aid, decisions=decisions))
+        stage("organize", [r["id"] for r in sampling.pending_assets(conn, "cut")],
+              lambda aid: organize_asset(conn, settings, aid))
+
     if not objective:
         console.print("[dim]Add --objective \"…\" to write the story, check it and render a preview.[/dim]")
         return
     try:
-        board, title = write_script(conn, vlm, objective=objective, name=name)
+        board, title = write_script(conn, vlm, objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]story: {e}[/red]")
         raise typer.Exit(1)
@@ -389,7 +402,7 @@ def check(
     edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
     data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
 ) -> None:
-    """Lint an EDL: replayed footage, look-alike food shots, tiny clips, food share, mixed formats."""
+    """Lint an EDL: replayed footage, story order, look-alike food shots, tiny clips, food share, mixed formats."""
     from .check import check_edl
 
     settings: Settings = get_settings()
@@ -405,6 +418,52 @@ def check(
     console.print(f"[bold]{row['name']}[/bold] ({row['id']})")
     if _print_findings(check_edl(conn, edl_mod.load(conn, row["id"]))):
         raise typer.Exit(1)
+
+
+@app.command()
+def verify(
+    edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
+    render: Path | None = typer.Option(None, "--render", help="Render file to inspect "
+                                       "(default: this EDL's preview in renders/)."),
+    sheets: bool = typer.Option(True, "--sheets/--no-sheets", help="Contact sheet per item + overview grid."),
+    waveform: bool = typer.Option(True, "--waveform/--no-waveform", help="Waveform PNG with the cut marks."),
+    audio: bool = typer.Option(True, "--audio/--no-audio", help="Per-item loudness/peak/silence pass."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable report on stdout "
+                                                     "(progress goes to stderr)."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Verify a render against its EDL: duration, cut placement, freezes, audio levels —
+    and write the artifacts a reviewer reads instead of watching (contact sheets, waveform)."""
+    from .verify import report_to_json, verify_render
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    row = conn.execute(
+        "SELECT id, name FROM edls WHERE ? IS NULL OR id = ? OR name = ? ORDER BY updated_at DESC LIMIT 1",
+        (edl, edl, edl)).fetchone()
+    if row is None:
+        console.print(f"[red]No EDL {edl!r}.[/red]" if edl else "[red]No EDLs yet.[/red]")
+        raise typer.Exit(1)
+    board = edl_mod.load(conn, row["id"])
+
+    out_console = Console(stderr=True) if json_out else console
+    if not json_out:
+        out_console.print(f"[bold]{row['name']}[/bold] ({row['id']})")
+    report = verify_render(conn, settings, board, render,
+                           sheets=sheets, waveform=waveform, audio=audio)
+    if json_out:
+        print(report_to_json(report))
+    else:
+        for item in report["items"]:
+            sheet = f"  sheet: {item['sheet']}" if item["sheet"] else ""
+            out_console.print(f"  [dim]item {item['item']}[/dim] "
+                              f"{item['output_start_s']:.2f}–{item['output_end_s']:.2f}s{sheet}")
+        if report["overview_sheet"]:
+            out_console.print(f"  [dim]overview: {report['overview_sheet']}[/dim]")
+        if _print_findings(report["findings"]):
+            raise typer.Exit(1)
 
 
 @app.command()
@@ -436,6 +495,27 @@ def transcribe(
         console.print(f"[green]{aid}[/green] ({i}/{len(targets)}): {n} utterances")
 
 
+@app.command("setup-whisper")
+def setup_whisper_cmd(
+    model: str | None = typer.Option(None, help="ggml model to install (default: AUTOVID_WHISPER_MODEL)."),
+) -> None:
+    """Download + verify the whisper.cpp Vulkan build, the model and the VAD model, then self-test.
+
+    Installs into whispercpp_dir (~/.whisper-vulkan by default). Binary and model hashes are
+    pinned in autovid/whisper_setup.py; the self-test fails loudly when the GPU is not used.
+    """
+    from .errors import AutoVidError
+    from .whisper_setup import setup_whisper
+
+    settings: Settings = get_settings()
+    try:
+        summary = setup_whisper(settings, model=model)
+    except AutoVidError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{summary}[/green]")
+
+
 @app.command()
 def script(
     objective: str = typer.Argument(..., help="What the vlog is about, e.g. 'mall day + pancake breakfast'."),
@@ -451,7 +531,9 @@ def script(
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
     try:
-        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name)
+        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)

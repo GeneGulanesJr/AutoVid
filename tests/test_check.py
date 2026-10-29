@@ -41,6 +41,25 @@ def test_replayed_footage_fails(conn):
     assert f["replay"].level == "fail" and f["replay"].detail.startswith("2.00s")
 
 
+def test_backward_jump_within_a_take_warns(conn):
+    board = EDL(items=[_item("a0", 10, 15), _item("a0", 0, 5)])        # back to 0s after 15s
+    f = _by_name(check_edl(conn, board))
+    assert f["story order"].level == "warn" and "item 2 goes back 15.0s" in f["story order"].detail
+    assert f["replay"].level == "ok"                                   # a jump, not footage playing twice
+
+
+def test_capture_order_within_a_take_does_not_warn(conn):
+    board = EDL(items=[_item("a0", 0, 5), _item("a0", 4.8, 9),         # 0.2 s of overlap: within tolerance
+                       _item("a1", 2, 7), _item("a1", 7, 12)])
+    assert "story order" not in _by_name(check_edl(conn, board))
+
+
+def test_backward_jump_is_tracked_per_take_across_interleaved_items(conn):
+    board = EDL(items=[_item("a0", 10, 15), _item("a1", 0, 5), _item("a0", 0, 5)])
+    f = _by_name(check_edl(conn, board))
+    assert f["story order"].level == "warn" and "item 3 goes back 15.0s" in f["story order"].detail
+
+
 def test_lookalike_food_shots_fail_and_a_speech_heavy_cut_warns(conn):
     board = EDL(items=[_item("a0", 0, 30), _item("a1", 0, 4, "b: [food] rice"), _item("a1", 20, 24, "b: [food] fish")])
     f = _by_name(check_edl(conn, board, fingerprint=lambda p, t: 0))   # identical frames

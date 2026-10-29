@@ -106,6 +106,14 @@ def _permanent(e: Exception) -> bool:
             and e.response.status_code not in (408, 429))
 
 
+def _ascii_key(key: str) -> None:
+    """HTTP headers cannot carry non-ASCII: a pasted-in mask or stray character would
+    surface as a bare "'ascii' codec can't encode" from httpx — name the real cause."""
+    if not key.isascii():
+        raise VLMUnavailable("the API key contains non-ASCII characters — paste it again "
+                             "(it may be a masked placeholder like ••••)")
+
+
 def list_models(
     base_url: str, api_key: str, transport: httpx.BaseTransport | None = None
 ) -> list[str]:
@@ -116,6 +124,7 @@ def list_models(
     """
     if not api_key:
         raise VLMUnavailable("no API key configured")
+    _ascii_key(api_key)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "x-api-key": api_key,
@@ -168,6 +177,7 @@ class VLMClient:
         parameter or model) are not, since they cannot succeed. Token usage is counted.
         """
         headers = {"Authorization": f"Bearer {self.settings.vlm_api_key}"}
+        _ascii_key(self.settings.vlm_api_key)
         url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
         last_error: str | None = None
         for attempt in range(self.settings.vlm_max_retries + 1):
@@ -194,6 +204,7 @@ class VLMClient:
         """One tiny call proving the key, base URL and model work; raises VLMUnavailable with the reason."""
         if not self.configured:
             raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        _ascii_key(self.settings.vlm_api_key)
         body = {"model": self.settings.vlm_model, "max_tokens": 16,
                 "messages": [{"role": "user", "content": "Reply with OK."}]}
         url = self.settings.vlm_base_url.rstrip("/") + "/chat/completions"
@@ -254,6 +265,7 @@ class VLMClient:
         """Analyze one window: ``frames`` is ``[(ts, b64_jpeg), ...]`` in order."""
         if not self.configured:
             raise VLMUnavailable("no AUTOVID_VLM_API_KEY configured")
+        _ascii_key(self.settings.vlm_api_key)
 
         ts_line = ", ".join(f"frame {i + 1} at t={ts:.2f}s" for i, (ts, _) in enumerate(frames))
         parts: list[dict[str, Any]] = [

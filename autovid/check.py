@@ -15,6 +15,7 @@ from .script import SAME_SCENE_BITS, Fingerprint, _fingerprint
 REPLAY_FAIL_S = 0.5      # more than this much footage played twice is a defect
 REPLAY_WARN_S = 0.1
 TINY_ITEM_S = 0.5
+BACKWARD_JUMP_S = 0.3    # a source start this far before the take's furthest point is a backward jump
 FOOD_SHARE_MIN = 0.25    # of the runtime, when the cut has food shots at all
 TIMELAPSE_MAX_SHARE = 0.5  # of a timelapse clip's own length
 
@@ -53,6 +54,19 @@ def check_edl(conn: sqlite3.Connection, board: EDL, *, fingerprint: Fingerprint 
                 replay += max(0.0, min(x.source_end, y.source_end) - max(x.source_start, y.source_start))
     level = "fail" if replay > REPLAY_FAIL_S else "warn" if replay > REPLAY_WARN_S else "ok"
     out.append(Finding(level, "replay", f"{replay:.2f}s of footage plays twice"))
+
+    # the story going back to earlier footage of one take (the LLM may list a take's items out of
+    # capture order); overlaps here are fine too — replay above judges footage that plays twice
+    high_water: dict[str, float] = {}
+    jumps: list[str] = []
+    for n, i in enumerate(items, 1):
+        mark = high_water.get(i.asset_id)
+        if mark is not None and i.source_start < mark - BACKWARD_JUMP_S:
+            jumps.append(f"item {n} goes back {mark - i.source_start:.1f}s")
+        high_water[i.asset_id] = i.source_end if mark is None else max(mark, i.source_end)
+    if jumps:
+        out.append(Finding("warn", "story order",
+                           "the story jumps back within a take: " + ", ".join(jumps)))
 
     tiny = [n for n, i in enumerate(items, 1) if i.source_end - i.source_start < TINY_ITEM_S]
     if tiny:
