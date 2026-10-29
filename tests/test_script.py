@@ -10,7 +10,7 @@ import pytest
 from autovid import db
 from autovid.config import Settings
 from autovid.errors import AutoVidError
-from autovid.script import write_script
+from autovid.script import _SPINE_SYSTEM, write_script
 from autovid.transcribe import load_model, transcribe_asset
 
 
@@ -31,11 +31,14 @@ class FakeWhisper:
 class FakeLLM:
     configured = True
 
-    def __init__(self, *replies):
+    def __init__(self, *replies, spine=None):
         self.replies = list(replies)
+        self.spine = spine or {}      # the story-plan call; empty plan = no story rules
         self.prompts = []
 
     def ask_json(self, system, user):
+        if system is _SPINE_SYSTEM:
+            return self.spine
         self.prompts.append(user)
         return self.replies.pop(0)
 
