@@ -242,22 +242,27 @@ const EXTRA = {
     <select id="modelList" onchange="pick('set_AUTOVID_VLM_MODEL', this.value)"><option value="">models…</option></select>
     <button class="act" onclick="testVlm()">Test connection</button>`,
 };
+// The key field shows the server's mask until the user types over it — an
+// untouched field means "use the saved key", so anything equal to the original
+// render is sent as empty rather than pasted in as if it were the key.
+const freshKey = () => {
+  const f = $("#set_AUTOVID_VLM_API_KEY");
+  return f.value === "" || f.value === f.dataset.orig ? "" : f.value;
+};
 async function testVlm() {
-  const key = $("#set_AUTOVID_VLM_API_KEY").value;
   $("#settingsMsg").textContent = "testing…";
   try {
     const r = await api("/api/vlm/test", {method: "POST", body: {
       base_url: $("#set_AUTOVID_VLM_BASE_URL").value, model: $("#set_AUTOVID_VLM_MODEL").value,
-      api_key: key.includes("…") ? "" : key}});
+      api_key: freshKey()}});
     $("#settingsMsg").textContent = `OK — ${r.model} answered`;
   } catch (e) { $("#settingsMsg").textContent = "test failed: " + e.message; }
 }
 async function loadModels() {
-  const key = $("#set_AUTOVID_VLM_API_KEY").value;
   try {
     const r = await api("/api/models", {method: "POST", body: {
       base_url: $("#set_AUTOVID_VLM_BASE_URL").value,
-      api_key: key.includes("…") ? "" : key,   // masked = use the saved key
+      api_key: freshKey(),   // untouched/masked = use the saved key
     }});
     $("#modelList").innerHTML = '<option value="">models…</option>' +
       r.models.map(m => `<option>${m}</option>`).join("");

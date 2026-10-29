@@ -165,3 +165,15 @@ def test_client_errors_are_not_retried_but_server_errors_are(settings):
     with pytest.raises(VLMUnavailable):
         _client(settings, _transport(responder(503))).describe_window(frames=[(0.0, "AAAA")])
     assert calls == [503, 503]                                    # transient: retried
+
+
+def test_non_ascii_key_fails_with_the_real_cause(settings):
+    """A pasted-in mask (••••) in a header surfaces as a bare 'ascii' codec error — name it."""
+    from autovid.vlm import list_models
+
+    with pytest.raises(VLMUnavailable, match="non-ASCII"):
+        list_models("https://vlm.test/api", "••••")
+    client = _client(settings, _transport(lambda r: httpx.Response(200, json=_completion("OK"))))
+    client.settings = client.settings.model_copy(update={"vlm_api_key": "••••"})
+    with pytest.raises(VLMUnavailable, match="non-ASCII"):
+        client.ping()
