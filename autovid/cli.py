@@ -421,6 +421,52 @@ def check(
 
 
 @app.command()
+def verify(
+    edl: str | None = typer.Argument(None, help="EDL id or name (default: the most recent)."),
+    render: Path | None = typer.Option(None, "--render", help="Render file to inspect "
+                                       "(default: this EDL's preview in renders/)."),
+    sheets: bool = typer.Option(True, "--sheets/--no-sheets", help="Contact sheet per item + overview grid."),
+    waveform: bool = typer.Option(True, "--waveform/--no-waveform", help="Waveform PNG with the cut marks."),
+    audio: bool = typer.Option(True, "--audio/--no-audio", help="Per-item loudness/peak/silence pass."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable report on stdout "
+                                                     "(progress goes to stderr)."),
+    data_dir: Path | None = typer.Option(None, help="Catalog dir (default AUTOVID_DATA_DIR)."),
+) -> None:
+    """Verify a render against its EDL: duration, cut placement, freezes, audio levels —
+    and write the artifacts a reviewer reads instead of watching (contact sheets, waveform)."""
+    from .verify import report_to_json, verify_render
+
+    settings: Settings = get_settings()
+    if data_dir is not None:
+        settings = settings.model_copy(update={"data_dir": data_dir})
+    conn = db.connect(settings.db_path)
+    row = conn.execute(
+        "SELECT id, name FROM edls WHERE ? IS NULL OR id = ? OR name = ? ORDER BY updated_at DESC LIMIT 1",
+        (edl, edl, edl)).fetchone()
+    if row is None:
+        console.print(f"[red]No EDL {edl!r}.[/red]" if edl else "[red]No EDLs yet.[/red]")
+        raise typer.Exit(1)
+    board = edl_mod.load(conn, row["id"])
+
+    out_console = Console(stderr=True) if json_out else console
+    if not json_out:
+        out_console.print(f"[bold]{row['name']}[/bold] ({row['id']})")
+    report = verify_render(conn, settings, board, render,
+                           sheets=sheets, waveform=waveform, audio=audio)
+    if json_out:
+        print(report_to_json(report))
+    else:
+        for item in report["items"]:
+            sheet = f"  sheet: {item['sheet']}" if item["sheet"] else ""
+            out_console.print(f"  [dim]item {item['item']}[/dim] "
+                              f"{item['output_start_s']:.2f}–{item['output_end_s']:.2f}s{sheet}")
+        if report["overview_sheet"]:
+            out_console.print(f"  [dim]overview: {report['overview_sheet']}[/dim]")
+        if _print_findings(report["findings"]):
+            raise typer.Exit(1)
+
+
+@app.command()
 def transcribe(
     asset_id: str | None = typer.Argument(None, help="Specific asset id (a_…)."),
     all: bool = typer.Option(False, "--all", help="Transcribe every asset with audio."),
