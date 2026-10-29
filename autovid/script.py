@@ -94,6 +94,9 @@ footage (often Taglish; some lines are mis-heard) plus scene descriptions, in ca
 Spoken lines are marked L<id>, food shots S<id>. Do not cut anything yet; write the plan:
 
 - premise: one sentence: what this video is about and why it is worth watching.
+- acts: the outing from start to finish as 3 to 6 stages in order (where we are going, getting \
+there, arriving, ordering, the food, the verdict...). refs = the 1 to 3 best ids that show that \
+stage; only stages the footage really has.
 - hook: up to 3 ids of the most striking moments to open on.
 - threads: at most 4, the ones a viewer who was not there would be lost without: a remark and \
 the reason for it, a plan and what came of it, a joke and its punchline, a dish and the story \
@@ -104,10 +107,10 @@ are in the log.
 verdict, a line that resolves the story), never a line that only sets something up.
 
 Pick by id only; never invent ids. Reply with JSON only: \
-{"premise": str, "hook": ["S4"], "threads": [{"name": str, "refs": ["L12", "S40"]}], "ending": ["L90"]}"""
+{"premise": str, "acts": [{"name": str, "refs": ["L3"]}], "hook": ["S4"], "threads": [{"name": str, "refs": ["L12", "S40"]}], "ending": ["L90"]}"""
 
 
-class Thread(BaseModel):
+class Thread(BaseModel):          # also used for an act: a named stage of the outing
     name: str = ""
     refs: list[str] = Field(default_factory=list)
 
@@ -115,6 +118,7 @@ class Thread(BaseModel):
 class Spine(BaseModel):
     """The story plan the cut is checked against (all-empty = no rules, e.g. the plan call failed)."""
     premise: str = ""
+    acts: list[Thread] = Field(default_factory=list)
     hook: list[str] = Field(default_factory=list)
     threads: list[Thread] = Field(default_factory=list)
     ending: list[str] = Field(default_factory=list)
@@ -261,9 +265,13 @@ def _plan(vlm: VLMClient, prompt: str) -> Spine:
 
 def _plan_text(spine: Spine) -> str:
     """The plan as extra prompt lines for the story call."""
-    if not (spine.hook or spine.threads or spine.ending):
+    if not (spine.acts or spine.hook or spine.threads or spine.ending):
         return ""
     out = ["\n\nStory plan (follow it):", f"- premise: {spine.premise}"]
+    if spine.acts:
+        out.append("- tell the whole outing in this order, with at least one of each stage's ids "
+                   "(the food focus never cuts a stage): "
+                   + "; ".join(f"{a.name} ({', '.join(a.refs)})" for a in spine.acts))
     if spine.hook:
         out.append(f"- open on one of: {', '.join(spine.hook)}")
     if spine.ending:
@@ -289,6 +297,10 @@ def _story_problems(spine: Spine, script: Script, lines: dict[int, dict], shots:
     if (end := valid(spine.ending)) and picks[-1] not in end:
         out.append(f"end on one of {', '.join(end)}, not {picks[-1]}")
     have = set(picks) | {f"S{i}" for i in shots}      # a skipped food shot is added back later anyway
+    for a in spine.acts:
+        refs = valid(a.refs)
+        if refs and not set(refs) & have:
+            out.append(f"stage \"{a.name}\" is missing: add one of {', '.join(refs)}")
     for t in spine.threads:
         refs = valid(t.refs)
         missing = [r for r in refs if r not in have]

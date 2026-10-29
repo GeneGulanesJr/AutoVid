@@ -395,7 +395,7 @@ def test_a_failed_plan_call_means_no_story_rules_not_a_failed_run(conn):
 
     a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
     board, title = write_script(conn, NoPlan(_cut("t", [f"L{a}"])), objective="o")
-    assert title == "t" and board.items and board.story == {"premise": "", "hook": [], "threads": [], "ending": []}
+    assert title == "t" and board.items and board.story == {"premise": "", "acts": [], "hook": [], "threads": [], "ending": []}
 
 
 def test_fingerprint_and_judge_frames_work_on_a_real_video(conn, tmp_path):
@@ -421,3 +421,17 @@ def test_fingerprint_and_judge_frames_work_on_a_real_video(conn, tmp_path):
     llm = Eye()
     assert _pick_best_shots(llm, {1: shot(1), 2: shot(2)}) == {1}
     assert llm.saw_image                                            # the judge really got the frames
+
+
+def test_a_cut_that_skips_a_stage_of_the_outing_is_reasked(conn):
+    why, sayang, close, food, spine = _story_fixture(conn)
+    spine["acts"] = [{"name": "arriving", "refs": [f"L{why}"]}, {"name": "tasting", "refs": [f"L{close}"]},
+                     {"name": "the food", "refs": [f"S{food}"]}]
+    spine["threads"] = []
+    skips = _cut("skips", [f"L{sayang}", f"L{close}"])      # arriving is missing; the food shot is added back later
+    full = _cut("full", [f"S{food}", f"L{why}", f"L{sayang}", f"L{close}"])
+    llm = FakeLLM(skips, full, spine=spine)
+    _, title = write_script(conn, llm, objective="o")
+    assert title == "full" and f'stage "arriving" is missing: add one of L{why}' in llm.prompts[1]
+    assert 'stage "the food"' not in llm.prompts[1]
+    assert "tell the whole outing" in llm.prompts[0]
