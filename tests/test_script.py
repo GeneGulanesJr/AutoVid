@@ -66,6 +66,23 @@ def _window(conn, asset, start, end, desc, foods, score=0.5):
          json.dumps({"description": desc, "foods": foods, "highlight_score": score, "uncertainty": 0.0}))).lastrowid
 
 
+def _patch_frame_at(monkeypatch, tmp_path):
+    """Frame extraction yields one real JPEG, so dish-moment labelling has pixels to look at."""
+    import shutil
+
+    from PIL import Image
+
+    import autovid.ffmpeg_io.frames as frames_mod
+    src = tmp_path / "frame.jpg"
+    Image.new("RGB", (64, 48), (180, 120, 60)).save(src)
+
+    def fake_frame_at(source, ts, out_path, *, width=None):
+        shutil.copyfile(src, out_path)
+        return ts, out_path
+
+    monkeypatch.setattr(frames_mod, "frame_at", fake_frame_at)
+
+
 def test_transcribe_stores_confident_speech_only(conn):
     model = FakeWhisper([
         _seg(0, 2, "  Good morning, ma'am. "),
@@ -306,6 +323,73 @@ def test_failed_dish_judge_falls_back_to_every_food_shot(conn):
     a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
     board, _ = write_script(conn, Flaky({"title": "t", "beats": [{"label": "b", "order": [f"L{a}"]}]}), objective="o")
     assert sum("[food]" in i.note for i in board.items) == 2
+
+
+def test_dish_moments_cut_the_food_shot_around_the_subject_frame(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    wide = {"dishes": ["pancakes"], "subject": None, "framing": "wide"}
+    subject = {"dishes": ["pancakes"], "subject": "pancakes", "framing": "close-up"}
+    # the 2 s grid of the 12 s window: 10.5, 12, 14, ... — the dish is the subject 4 s in, at 14
+    llm = FakeLLM(wide, wide, subject,
+                  {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (12.0, 16.0)   # centred on the subject frame
+    assert len(llm.prompts) == 4      # 3 frame labels (short-circuited) + the story; no judge for one shot
+    label = llm.prompts[0]
+    assert isinstance(label, list) and sum(p.get("type") == "image_url" for p in label) == 1
+
+
+def test_failed_frame_labelling_keeps_the_window_centre_slice(conn, monkeypatch, tmp_path):
+    from autovid.vlm import VLMUnavailable
+
+    _patch_frame_at(monkeypatch, tmp_path)
+
+    class Flaky(FakeLLM):
+        def ask_json(self, system, user):
+            if "label one frame" in system:      # the frame labeller, not the story's {"label": str} spec
+                raise VLMUnavailable("down")
+            return super().ask_json(system, user)
+
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    llm = Flaky({"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (14.0, 18.0)   # the old window-centre slice
+    assert len(llm.prompts) == 1      # labelling stopped at the first failure; only the story was asked
+
+
+def test_frames_that_never_show_the_dish_keep_the_window_centre_slice(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 22.0, "a plate of pancakes", ["pancakes"])
+    other = {"dishes": ["the table", "drinks"], "subject": None, "framing": "wide"}
+    llm = FakeLLM(*([other] * 7 + [   # every grid frame of the 12 s window: 10.5 … 21.5
+        {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]}]))
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (14.0, 18.0)
+    assert len(llm.prompts) == 8      # all 7 frames labelled (no short-circuit) + the story
+
+
+def test_dish_moments_fall_back_to_a_visible_frame_preferring_the_close_up(conn, monkeypatch, tmp_path):
+    _patch_frame_at(monkeypatch, tmp_path)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    food = _window(conn, "a_0", 10.0, 18.0, "a plate of pancakes", ["pancakes"])
+    wide = {"dishes": ["pancakes"], "subject": None, "framing": "wide"}
+    close = {"dishes": ["pancakes"], "subject": None, "framing": "close-up"}
+    gone = {"dishes": ["somebody's back"], "subject": None, "framing": "wide"}
+    # frames 10.5 (visible, wide), 12 (visible, close-up — the better fallback), 14 (visible but
+    # wide: does not beat the close-up), 16 and 17.5 (dish gone); no frame makes it the subject
+    llm = FakeLLM(wide, close, wide, gone, gone,
+                  {"title": "t", "beats": [{"label": "b", "order": [f"S{food}", f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", dish_moments=True)
+    shot = next(i for i in board.items if "[food]" in i.note)
+    assert (shot.source_start, shot.source_end) == (10.0, 14.0)   # centred on the 12 s close-up
+    assert len(llm.prompts) == 6
 
 
 def test_food_shot_is_dropped_when_only_a_sliver_of_its_window_is_free(conn):
