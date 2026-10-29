@@ -110,7 +110,9 @@ def run(
         console.print("[dim]Add --objective \"…\" to write the story, check it and render a preview.[/dim]")
         return
     try:
-        board, title = write_script(conn, vlm, objective=objective, name=name)
+        board, title = write_script(conn, vlm, objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]story: {e}[/red]")
         raise typer.Exit(1)
@@ -447,6 +449,27 @@ def transcribe(
         console.print(f"[green]{aid}[/green] ({i}/{len(targets)}): {n} utterances")
 
 
+@app.command("setup-whisper")
+def setup_whisper_cmd(
+    model: str | None = typer.Option(None, help="ggml model to install (default: AUTOVID_WHISPER_MODEL)."),
+) -> None:
+    """Download + verify the whisper.cpp Vulkan build, the model and the VAD model, then self-test.
+
+    Installs into whispercpp_dir (~/.whisper-vulkan by default). Binary and model hashes are
+    pinned in autovid/whisper_setup.py; the self-test fails loudly when the GPU is not used.
+    """
+    from .errors import AutoVidError
+    from .whisper_setup import setup_whisper
+
+    settings: Settings = get_settings()
+    try:
+        summary = setup_whisper(settings, model=model)
+    except AutoVidError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{summary}[/green]")
+
+
 @app.command()
 def script(
     objective: str = typer.Argument(..., help="What the vlog is about, e.g. 'mall day + pancake breakfast'."),
@@ -462,7 +485,9 @@ def script(
         settings = settings.model_copy(update={"data_dir": data_dir})
     conn = db.connect(settings.db_path)
     try:
-        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name)
+        board, title = write_script(conn, VLMClient(settings), objective=objective, name=name,
+                                    timelapse_montage=settings.timelapse_montage,
+                                    dish_moments=settings.dish_moments)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)

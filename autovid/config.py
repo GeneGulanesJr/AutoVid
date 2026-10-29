@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     # Script stage: a timelapse clip gives one best food shot by default; this opts into
     # a continuous montage of up to half the clip's own length instead (still one item).
     timelapse_montage: bool = False
+    # Script stage: label the 2 s grid frames of each kept food window with the VLM and centre
+    # the shot on a frame where its dish is the subject (≈240 single-image calls per 8 min of
+    # food footage). Off by default: the window-centre slice is free.
+    dish_moments: bool = False
 
     # Baseline sampling policy (the decision layer may override per region).
     grid_interval_s: float = 2.0
