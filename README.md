@@ -207,6 +207,12 @@ the server's own reason (the Settings page has the same **Test connection** butt
 - `autovid check [edl]` lints an EDL: footage that plays twice, food shots that look the same, tiny clips, food
   share of the runtime, a timelapse used too much, mixed formats. Exits non-zero on a defect. `script` and `run`
   print it automatically.
+- `autovid verify [edl]` inspects the finished render against its EDL: duration, cut placement (a scene-score spike
+  is expected at every planned boundary), mid-shot pops, frozen stretches, per-item loudness/clipping/silence. It
+  also writes contact sheets (one grid per item + an overview of the whole cut) and a waveform PNG with the cut
+  marks on it into `catalog/renders/<edl_id>/verify/` — the artifacts a reviewer or agent reads instead of watching
+  video. `--json` prints the machine-readable report on stdout (progress on stderr); exits non-zero on a defect.
+  See `docs/verify-loop.md`.
 - `autovid analyze --force` re-analyzes assets already analyzed (replacing, never duplicating, their rows).
 - Clips up to 10 minutes are analyzed in 8 s windows (`AUTOVID_FINE_WINDOW_S`), so a dish or reaction is placed to
   seconds, not a minute; longer footage keeps the 60 s windows.
