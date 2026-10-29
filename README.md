@@ -173,9 +173,17 @@ mocked model calls — no network, no API key needed).
 `autovid transcribe --all` fills the `transcripts` table; `autovid script "<objective>" --duration 60`
 then has the LLM pick the spoken lines that tell the story (speech-only EDL, render as usual).
 
+**One-command GPU setup:** `autovid setup-whisper` downloads the whisper.cpp Vulkan build, the
+`ggml-large-v3.bin` model and the silero VAD model into `~/.whisper-vulkan` (override with
+`AUTOVID_WHISPERCPP_DIR`), checks them against the sha256 hashes and sizes pinned in
+`autovid/whisper_setup.py`, and runs a one-second self-test that fails loudly if whisper.cpp
+silently falls back to the CPU (update your GPU driver, then re-run). Re-runs only download
+or extract what is missing or changed.
+
 Backends (`AUTOVID_WHISPER_BACKEND`, default `auto`):
 
-- **whispercpp** (AMD/Intel/NVIDIA GPU via Vulkan). Put a Windows Vulkan build of whisper.cpp at
+- **whispercpp** (AMD/Intel/NVIDIA GPU via Vulkan). Manual fallback for the command above: put a
+  Windows Vulkan build of whisper.cpp at
   `~/.whisper-vulkan/bin/whisper-cli.exe` (e.g. `whisper-*-windows-vulkan-x64.zip` from
   lemonade-sdk/whisper.cpp-rocm releases), plus `models/ggml-large-v3.bin`
   (huggingface.co/ggerganov/whisper.cpp) and `models/ggml-silero-v5.1.2.bin`
