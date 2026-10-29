@@ -5,21 +5,27 @@ Tags, and what the pipeline does with them:
 - ``speech``       talking footage: the cut stage ignores its (low) visual highlight score,
                    because the value is in what is said (see ``refine.catalog_scenes``).
 - ``timelapse``    time-compressed footage: a long run of near-identical shots; the script stage
-                   keeps at most one food shot from it.
+                   keeps at most one food shot from it (or, opt-in, a half-length montage).
 - ``other_camera`` frame size / rate differs from most of the footage: rendering conforms it.
 - ``no_audio``     no audio track: rendering adds silence so clips can be joined.
 
-shortcut: timelapse is inferred from recording times. A clip counts when the next clip was
-recorded TIMELAPSE_RATIO times its length later *and* it is in a different format (the usual
-timelapse mode), or when the gap is extreme on its own. A long pause between ordinary clips
-(waiting for food) has the ratio but not the format, so it is not flagged. Upgrade: read the
-camera's own timelapse flag when the container carries one.
+Timelapse detection — any one of three independent signals is enough:
+- the container's own marker: any ffprobe tag (format or stream) whose key or value names
+  "timelapse" / "time_lapse",
+- the gap to the next clip: recorded TIMELAPSE_RATIO times this clip's length later *and* in
+  a different format from the majority (the usual timelapse mode), or TIMELAPSE_RATIO_ALONE
+  on its own,
+- being the session's last clip (no next clip to measure a gap against) and
+  TIMELAPSE_RATIO_ALONE times longer than the median of the session's other timed clips.
+A long pause between ordinary clips (waiting for food) has the ratio but not the format, so
+it is not flagged.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 from datetime import datetime
+from statistics import median
 
 TIMELAPSE_RATIO = 4.0         # gap to the next clip / this clip's length, with a different format
 TIMELAPSE_RATIO_ALONE = 20.0  # ... or this much on its own
@@ -40,6 +46,21 @@ def _recorded_at(row: sqlite3.Row) -> datetime | None:
             except ValueError:
                 return None
     return None
+
+
+def _flagged_timelapse(row: sqlite3.Row) -> bool:
+    """The camera's own timelapse marker (any format or stream tag key/value naming it), else False."""
+    try:
+        info = json.loads(row["ffprobe_json"] or "{}")
+    except ValueError:
+        return False
+    tags = [info.get("format", {}).get("tags") or {}] + [s.get("tags") or {} for s in info.get("streams", [])]
+    for t in tags:
+        for k, v in t.items():
+            text = f"{k} {v}".lower()
+            if "timelapse" in text or "time_lapse" in text:
+                return True
+    return False
 
 
 def classify(conn: sqlite3.Connection) -> dict[str, set[str]]:
@@ -67,9 +88,18 @@ def classify(conn: sqlite3.Connection) -> dict[str, set[str]]:
             tags.add("no_audio")
         if majority and fmt(r) != majority:
             tags.add("other_camera")
+        if _flagged_timelapse(r):
+            tags.add("timelapse")
         if dur > 0 and r["id"] in next_start:
             ratio = (next_start[r["id"]] - when[r["id"]]).total_seconds() / dur
             if ratio >= TIMELAPSE_RATIO_ALONE or (ratio >= TIMELAPSE_RATIO and "other_camera" in tags):
+                tags.add("timelapse")
+        elif dur > 0 and when[r["id"]] is not None:
+            # the session's last clip has no next clip to measure a gap against, so compare its
+            # length with the session's other timed clips instead
+            others = [float(o["duration_s"] or 0.0) for o in timed if o["id"] != r["id"]]
+            med = median(others) if others else 0.0
+            if med > 0 and dur >= TIMELAPSE_RATIO_ALONE * med:
                 tags.add("timelapse")
         if dur > 0 and speech.get(r["id"], 0.0) / dur >= SPEECH_DENSITY:
             tags.add("speech")

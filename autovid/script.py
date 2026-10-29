@@ -11,7 +11,10 @@ and picks the lines and shots. Code then guarantees:
 - nothing repeats: no stretch of footage plays twice (speech claims its time
   first, food shots take the free part of their window), and a shot whose frame
   is near-identical to an earlier shot of the same take is dropped (analysis
-  windows of one continuous scene would otherwise yield a run of look-alikes).
+  windows of one continuous scene would otherwise yield a run of look-alikes), and
+- a timelapse asset gives at most one food shot; with ``timelapse_montage`` it
+  gives one continuous montage of up to half its own length instead (centred on
+  its best window), falling back to the plain best shot when speech leaves no room.
 
 shortcut: a food shot is a free 4 s slice of the analysis window that lists the
 dish (the VLM says which dishes a window shows, not when); shorter analysis
@@ -224,8 +227,9 @@ def _picked(script: Script, lines: dict[int, dict], shots: dict[int, dict]) -> l
     return picked
 
 
-def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]]) -> tuple[float, float] | None:
-    """The best SHOT_S-or-shorter slice of ``window`` that touches no ``blocked`` range, or None.
+def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]],
+                cap: float = SHOT_S) -> tuple[float, float] | None:
+    """The best ``cap``-or-shorter slice of ``window`` that touches no ``blocked`` range, or None.
 
     Best = the longest free stretch (ties: closest to the window centre), centred in that stretch.
     """
@@ -241,12 +245,12 @@ def _free_slice(window: tuple[float, float], blocked: list[tuple[float, float]])
         free.append((cursor, we))
     centre = (ws + we) / 2
     # a sliver squeezed between speech clips is not a shot: the dish is already on screen while they talk
-    need = max(MIN_SHOT_S, min(SHOT_S, we - ws) / 2)
+    need = max(MIN_SHOT_S, min(cap, we - ws) / 2)
     free = [f for f in free if f[1] - f[0] >= need]
     if not free:
         return None
-    s, e = max(free, key=lambda f: (min(f[1] - f[0], SHOT_S), -abs((f[0] + f[1]) / 2 - centre)))
-    length = min(e - s, SHOT_S)
+    s, e = max(free, key=lambda f: (min(f[1] - f[0], cap), -abs((f[0] + f[1]) / 2 - centre)))
+    length = min(e - s, cap)
     start = min(max(centre - length / 2, s), e - length)
     return round(start, 3), round(start + length, 3)
 
@@ -271,7 +275,7 @@ def _cover_segment(conn: sqlite3.Connection, asset: sqlite3.Row) -> int:
 
 def _build(
     conn: sqlite3.Connection, script: Script, lines: dict[int, dict], shots: dict[int, dict],
-    assets: dict[str, sqlite3.Row], fingerprint: Fingerprint,
+    assets: dict[str, sqlite3.Row], fingerprint: Fingerprint, *, timelapse_montage: bool = False,
 ) -> tuple[list[EDLItem], float, float]:
     """Turn the LLM's story into EDL items; returns (items, speech seconds, food seconds)."""
     picked = _picked(script, lines, shots)
@@ -318,7 +322,8 @@ def _build(
 
     def place(shot: dict) -> tuple[float, float] | None:
         """Fit ``shot`` (reserving its range) unless it overlaps used footage or repeats a kept look."""
-        span = _free_slice((shot["start"], shot["end"]), blocked.get(shot["asset_id"], []))
+        span = _free_slice((shot["start"], shot["end"]), blocked.get(shot["asset_id"], []),
+                           cap=shot.get("cap", SHOT_S))
         if span is None:
             return None
         fp = fingerprint(shot["path"], (span[0] + span[1]) / 2)
@@ -330,18 +335,49 @@ def _build(
         blocked.setdefault(shot["asset_id"], []).append(span)
         return span
 
+    # Timelapse option: one continuous montage of up to half the asset, centred on the asset's
+    # best food window, instead of the single best shot. Placed before the plain shots so it
+    # claims its span first; if speech leaves less than half the span free (or the asset is too
+    # short for a real montage), the plain best shot below plays instead.
+    montages: list[dict] = []
+    if timelapse_montage:
+        best_tl: dict[str, dict] = {}
+        for shot in shots.values():
+            if shot["timelapse"]:
+                shot["skip"] = False                       # rebuilds must not inherit an earlier verdict
+                if shot["asset_id"] not in best_tl or shot["quality"] > best_tl[shot["asset_id"]]["quality"]:
+                    best_tl[shot["asset_id"]] = shot
+        for asset_id, b in best_tl.items():
+            dur = float(assets[asset_id]["duration_s"] or 0.0)
+            centre = (b["start"] + b["end"]) / 2
+            length = min(dur / 2, 2 * min(centre, dur - centre))
+            if length < SHOT_S:
+                continue
+            montage = {**b, "start": max(0.0, centre - length / 2), "end": min(dur, centre + length / 2),
+                       "cap": length}
+            if (span := place(montage)) is not None:
+                b["skip"] = True                           # the montage replaces the single best shot
+                montages.append({"key": (b["name"], b["start"]), "shot": montage, "span": span})
+
     kept: list[dict] = []
     for s in slots:
         if s["kind"] == "line":
             kept.append(s)
-        elif (span := place(s["shot"])) is not None:
+        elif not s["shot"].get("skip") and (span := place(s["shot"])) is not None:
             s["span"] = span
             kept.append(s)
     slots = kept
+    for m in montages:                                     # capture order, like the shots added below
+        at = max((i + 1 for i, s in enumerate(slots) if s["key"] <= m["key"]),
+                 default=min(1, len(slots)))
+        slots.insert(at, {"label": slots[at - 1]["label"] if at else "Food", "kind": "shot",
+                          "key": m["key"], "shot": m["shot"], "span": m["span"]})
 
     # 3. Every food moment the story skipped is added where it falls in capture order (best frames
     #    first, so a static scene keeps its best shot and the rest drop out as look-alikes).
     for shot in sorted(shots.values(), key=lambda x: -x["quality"]):
+        if shot.get("skip"):
+            continue
         if any(s["kind"] == "shot" and s["shot"] is shot for s in slots):
             continue
         if (span := place(shot)) is None:
@@ -367,9 +403,13 @@ def _build(
 
 def write_script(
     conn: sqlite3.Connection, vlm: VLMClient, *, objective: str, name: str = "script-cut",
-    fingerprint: Fingerprint = _fingerprint,
+    fingerprint: Fingerprint = _fingerprint, timelapse_montage: bool = False,
 ) -> tuple[EDL, str]:
-    """Ask the LLM for the story, turn it into an EDL; returns (EDL, title)."""
+    """Ask the LLM for the story, turn it into an EDL; returns (EDL, title).
+
+    ``timelapse_montage``: a timelapse asset contributes one continuous span of up to half its
+    own length (centred on its best food window) instead of the single best shot.
+    """
     footage, lines, shots = _source_prompt(conn)
     if not lines:
         raise AutoVidError("no transcripts in the catalog — run `transcribe` first")
@@ -380,7 +420,8 @@ def write_script(
     prompt = f"Objective: {objective}\n{footage}"
 
     script = _ask(vlm, prompt)
-    items, speech_s, food_s = _build(conn, script, lines, shots, assets, fingerprint)
+    items, speech_s, food_s = _build(conn, script, lines, shots, assets, fingerprint,
+                                     timelapse_montage=timelapse_montage)
     if food_s and speech_s > SPEECH_PER_FOOD * food_s:
         # Food focus is the point and the LLM drifts towards talk, so give it a measured budget once.
         budget = SPEECH_PER_FOOD * food_s
@@ -389,7 +430,8 @@ def write_script(
                           f"of food. Make it food-focused: the spoken lines must total at most {budget:.0f}s. "
                           f"Keep the best lines (plan, ordering, reactions, verdict), cut the chatter, and "
                           f"keep every food shot.")
-        items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint)
+        items2, speech2, food2 = _build(conn, retry, lines, shots, assets, fingerprint,
+                                        timelapse_montage=timelapse_montage)
         if speech2 / max(food2, 1) < speech_s / food_s:      # only accept an improvement
             script, items = retry, items2
 

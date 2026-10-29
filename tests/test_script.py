@@ -333,3 +333,50 @@ def test_a_timelapse_contributes_at_most_its_best_shot_and_is_labelled_for_the_j
     assert any("TIMELAPSE" in p.get("text", "") for p in llm.prompts[0])        # the judge was told
     food = [i for i in board.items if "[food]" in i.note]
     assert sorted(i.note.split("[food] ")[1] for i in food) == ["noodles", "pancakes"]
+
+
+def test_timelapse_montage_option_takes_half_the_clip_as_one_continuous_span(conn, monkeypatch):
+    import autovid.script as script_mod
+
+    monkeypatch.setattr(script_mod, "classify", lambda c: {"a_0": set(), "a_1": {"timelapse"}})
+    conn.execute("UPDATE assets SET duration_s = 78 WHERE id = 'a_1'")
+    plain = _window(conn, "a_0", 5.0, 13.0, "close-up pancakes", ["pancakes"])
+    t1 = _window(conn, "a_1", 0.0, 8.0, "table", ["fried rice"], score=0.4)
+    t2 = _window(conn, "a_1", 35.0, 43.0, "table", ["noodles"], score=0.9)   # the best, centre at 39 s
+    t3 = _window(conn, "a_1", 60.0, 68.0, "table", ["fish"], score=0.5)
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    judge = {"dishes": [{"dish": d, "best": i} for d, i in
+                        (("pancakes", plain), ("rice", t1), ("noodles", t2), ("fish", t3))]}
+    llm = FakeLLM(judge, {"title": "t", "beats": [{"label": "b", "order": [f"L{a}"]}]})
+    board, _ = write_script(conn, llm, objective="o", timelapse_montage=True)
+    food = [i for i in board.items if "[food]" in i.note]
+    # one continuous 39 s span (= half of 78 s, centred on the best window's centre) replaces
+    # the single best shot; the other timelapse windows stay out
+    assert [(i.asset_id, round(i.source_start, 1), round(i.source_end, 1)) for i in food] == [
+        ("a_0", 7.0, 11.0), ("a_1", 19.5, 58.5)]
+    assert [i.asset_id for i in board.items] == ["a_0", "a_0", "a_1"]
+
+
+def test_timelapse_montage_falls_back_to_the_best_shot_when_speech_blocks_the_span(conn, monkeypatch):
+    import autovid.script as script_mod
+
+    monkeypatch.setattr(script_mod, "classify", lambda c: {"a_0": set(), "a_1": {"timelapse"}})
+    conn.execute("UPDATE assets SET duration_s = 78 WHERE id = 'a_1'")
+    t1 = _window(conn, "a_1", 0.0, 8.0, "table", ["fried rice"], score=0.4)
+    t2 = _window(conn, "a_1", 35.0, 43.0, "table", ["noodles"], score=0.9)   # the timelapse's best
+    talk = _line(conn, "a_1", 20.0, 40.0, "Ang haba ng pila")                # blocks most of the 19.5-58.5 s span
+    a = _line(conn, "a_0", 1.0, 3.0, "Tara na!")
+    judge = {"dishes": [{"dish": "rice", "best": t1}, {"dish": "noodles", "best": t2}]}
+    reply = {"title": "t", "beats": [{"label": "b", "order": [f"L{a}", f"L{talk}"]}]}
+    llm = FakeLLM(judge, reply, reply)      # speech-heavy: the food-focus re-ask gets the same story
+    board, _ = write_script(conn, llm, objective="o", timelapse_montage=True)
+    food = [i for i in board.items if "[food]" in i.note]
+    # 18.2 s free < half the span → no montage; the plain best shot takes the free 40.3-43 s instead
+    assert [(i.asset_id, round(i.source_start, 1), round(i.source_end, 1)) for i in food] == [
+        ("a_1", 40.3, 43.0)]
+
+
+def test_timelapse_montage_setting_defaults_off_and_reads_the_env(monkeypatch):
+    assert Settings().timelapse_montage is False
+    monkeypatch.setenv("AUTOVID_TIMELAPSE_MONTAGE", "true")
+    assert Settings().timelapse_montage is True
