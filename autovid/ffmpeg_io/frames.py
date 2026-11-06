@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 from ..errors import AutoVidError
-from .bins import ffmpeg_path
+from .bins import ffmpeg_path, hwaccel_args
 from .scenes import SceneChange, merge_detections, parse_scene_pairs
 
 _PTS_TIME_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
@@ -78,7 +78,7 @@ def extract_periodic_frames(
     try:
         stderr = _run([
             ffmpeg_path(), "-nostdin", "-y", "-v", "info",
-            *seek,
+            *seek, *hwaccel_args(),
             "-i", str(source),
             "-vf", vf,
             "-fps_mode", "vfr",
@@ -131,7 +131,7 @@ def extract_grid_and_scene_changes(
     )
     try:
         stderr = _run([
-            ffmpeg_path(), "-nostdin", "-y", "-v", "info",
+            ffmpeg_path(), "-nostdin", "-y", "-v", "info", *hwaccel_args(),
             "-i", str(source),
             "-filter_complex", filter_complex,
             "-map", "[gout]", "-fps_mode", "vfr", str(pattern),
@@ -164,7 +164,7 @@ def frame_at(
     timestamp is the requested ``ts`` itself.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-ss", f"{ts:.3f}", "-i", str(source)]
+    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", *hwaccel_args(), "-ss", f"{ts:.3f}", "-i", str(source)]
     if width:
         cmd += ["-vf", f"scale={width}:-2"]
     cmd += ["-frames:v", "1", str(out_path)]

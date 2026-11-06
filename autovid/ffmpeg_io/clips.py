@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from ..errors import AutoVidError
-from .bins import ffmpeg_path
+from .bins import ffmpeg_path, hwaccel_args
 
 
 def clip_filename(asset_id: str, start_s: float, end_s: float) -> str:
@@ -36,7 +36,10 @@ def extract_clip(
     if end_s <= start_s:
         raise AutoVidError(f"invalid clip span [{start_s:.3f}, {end_s:.3f})")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(source)]
+    cmd = [ffmpeg_path(), "-nostdin", "-y", "-v", "error", "-ss", f"{start_s:.3f}"]
+    if reencode:  # stream copy never decodes, so it needs no GPU
+        cmd += hwaccel_args()
+    cmd += ["-i", str(source)]
     if reencode:
         cmd += ["-t", f"{end_s - start_s:.3f}",
                 "-c:v", "libx264", "-preset", preset, "-crf", str(crf),

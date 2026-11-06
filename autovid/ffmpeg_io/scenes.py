@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import AutoVidError
-from .bins import ffmpeg_path
+from .bins import ffmpeg_path, hwaccel_args
 
 # metadata=print prefixes every line with "[Parsed_metadata_N @ addr] ", so the
 # scene_score line never directly follows pts_time — allow bounded junk between.
@@ -78,7 +78,7 @@ def detect_scene_changes(
     which produces the same detections from a shared decode.
     """
     cmd = [
-        ffmpeg_path(), "-nostdin", "-v", "info",
+        ffmpeg_path(), "-nostdin", "-v", "info", *hwaccel_args(),
         "-i", str(source),
         "-vf", f"select='gt(scene,{threshold})',metadata=print",
         "-fps_mode", "vfr",
